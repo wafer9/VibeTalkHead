@@ -1,0 +1,74 @@
+## model_args
+stage: 0
+
+temporal_model: /nfs-speech-cfs/wangzhou/.cache/models/Qwen3-0.6B-Base # Qwen2.5-7B-Instruct
+vibevoice_path: /nfs-speech-cfs/wangzhou/.cache/models/VibeVoice-1.5B
+
+tokenizer_config:
+    chat_template: /nfs-speech-cfs/wangzhou/.cache/models/Qwen2.5-7B-Instruct/chat_template.jinja
+vae_path: /nfs-speech-cfs/wangzhou/tts/SoulX-FlashHead/models/SoulX-FlashHead-1_3B/VAE_Wan/Wan2.1_VAE.pth
+
+dataset_conf:
+    filter_conf:
+        max_length: 30 # second
+        min_length: 0.5
+        token_max_length: 500 # 5min * 200
+        token_min_length: 1
+    shuffle: true
+    shuffle_conf:
+        shuffle_size: 200
+    sort: true
+    sort_conf:
+        sort_size: 200  # sort_size should be less than shuffle_size
+    batch_conf:
+        batch_type: 'static' # static or dynamic
+        batch_size: 4
+        # max_frames_in_batch: 3000
+    is_inference: false
+    chat: False
+    shard_latent: true
+    spk_sim_thresh: 0.7
+    fbank_conf:
+        num_mel_bins: 128
+
+
+grad_clip: 1
+accum_grad: 2
+max_epoch: 200
+log_interval: 100
+optim_conf:
+    lr: 0.001 # 0.000005 # 0.0000001 0.00005 0.00001
+scheduler_conf:
+    warmup_steps: 500
+dtype: bf16
+
+
+audio_model: /nfs-speech-cfs/wangzhou/.cache/models/large-v3.pt 
+audio_config:
+    model_type: whisper_openai
+    apply_spec_augment: false
+    mask_time_prob: 0.2
+    mask_time_length: 10
+    mask_time_min_masks: 2
+    mask_feature_prob: 0.27
+    mask_feature_length: 10
+    mask_feature_min_masks: 1
+
+
+diffusion_head_config:
+    ddpm_batch_mul: 4
+    ddpm_beta_schedule: 'cosine'
+    ddpm_num_inference_steps: 20
+    ddpm_num_steps: 1000
+    diffusion_type: 'ddpm'
+    head_ffn_ratio: 3.0
+    head_layers: 4
+    hidden_size: 1280
+    latent_size: 40
+    model_type: vibevoice_diffusion_head
+    prediction_type: v_prediction
+    # rms_norm_eps: 1e-05
+    speech_vae_dim: 40
+
+run_name: vibe_qwen3_1p7b_conv_4
+

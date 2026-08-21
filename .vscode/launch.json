@@ -1,0 +1,89 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug",
+            "type": "python",
+            "request": "launch",
+            "program": "/data/joe/anaconda3/envs/flashhead/lib/python3.10/site-packages/torch/distributed/launch.py",
+            "cwd": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "HUGGINGFACE_HUB_CACHE": "/nfs-speech-cfs/wangzhou/.cache/huggingface",
+                "TRANSFORMERS_CACHE": "/nfs-speech-cfs/wangzhou/.cache/transformers",
+                "HF_HOME": "/nfs-speech-cfs/wangzhou/.cache/huggingface",
+                "RANK": "0",
+                "WORLD_SIZE": "1",
+                "PYTHONPATH": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan"
+            },
+            "args": [
+                "--nproc-per-node=1",
+                "--master_port=25678",
+                "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/twinlakes/bin/train.py",
+                "--config", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/conf/run_stage1.yaml",
+                "--data_type", "raw",
+                "--train_data", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker/train_talker_vivid.json",
+                "--cv_data", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker/dev.json",
+                "--model_dir", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/exp/s0",
+                "--tensorboard_dir", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/exp/tensorboard",
+                "--ddp.dist_backend", "nccl",
+                "--num_workers", "1",
+            ]
+        }
+    ]
+}
+
+
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Python: Debug",
+//             "type": "python",
+//             "request": "launch",
+//             "program": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/twinlakes/bin/infer_video.py",
+//             "cwd": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan",
+//             "console": "integratedTerminal",
+//             "justMyCode": false,
+//             "env": {
+//                 "OMP_NUM_THREADS": "1",
+//                 "CUDA_VISIBLE_DEVICES": "0",
+//                 "PYTHONPATH": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan",
+//             },
+//             "args": [
+//                 "--config", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/exp/s1/train.yaml",
+//                 "--checkpoint", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/exp/s1/18.pt",
+//                 "--test_data", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/vivi/dev_latent.list",
+//                 "--result_dir", "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/exp/s1/infer_out",
+//                 "--cfg_scale", "1.0",
+//                 "--num_steps", "20",
+//                 "--max_seconds", "8",
+//                 "--limit", "1",
+//             ]
+//         }
+//     ]
+// }
+
+// {
+//     "version": "0.2.0",
+//     "configurations": [
+//         {
+//             "name": "Python: Debug",
+//             "type": "python",
+//             "request": "launch",
+//             "program": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan/twinlakes/bin/infer_wan_lst.py",
+//             "cwd": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan",
+//             "console": "integratedTerminal",
+//             "justMyCode": false,
+//             "env": {
+//                 "OMP_NUM_THREADS": "1",
+//                 // "CUDA_VISIBLE_DEVICES": "4",
+//                 "PYTHONPATH": "/nfs-speech-cfs/wangzhou/s2s/vibehead_wan",
+//             },
+//             "args": [
+//             ]
+//         }
+//     ]
+// }

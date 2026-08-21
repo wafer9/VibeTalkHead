@@ -1,0 +1,73 @@
+## model_args
+stage: 0
+
+temporal_model: /nfs-speech-cfs/wangzhou/.cache/models/Qwen3-1.7B-Base # Qwen2.5-7B-Instruct
+vibevoice_path: /nfs-speech-cfs/wangzhou/.cache/models/VibeVoice-1.5B
+
+tokenizer_config:
+    chat_template: /nfs-speech-cfs/wangzhou/.cache/models/Qwen2.5-7B-Instruct/chat_template.jinja
+vae_path: /nfs-speech-cfs/wangzhou/tts/SoulX-FlashHead/models/SoulX-FlashHead-1_3B/VAE_Wan/Wan2.1_VAE.pth
+
+dataset_conf:
+    filter_conf:
+        max_length: 30 # second
+        min_length: 0.5
+        token_max_length: 500 # 5min * 200
+        token_min_length: 1
+    shuffle: true
+    shuffle_conf:
+        shuffle_size: 32
+    sort: true
+    sort_conf:
+        sort_size: 16  # WAN latent 很大，避免 datapipe buffer 占用数 GB CPU 内存
+    batch_conf:
+        batch_type: 'static' # static or dynamic
+        batch_size: 2
+        # max_frames_in_batch: 3000
+    is_inference: false
+    chat: False
+    shard_latent: true
+    spk_sim_thresh: 0.7
+
+grad_clip: 1
+accum_grad: 2
+max_epoch: 50
+log_interval: 100
+optim_conf:
+    lr: 0.0001
+# 预训练 LLM 用更小学习率；LocEnc/VideoDiT/acoustic connector 使用 optim_conf.lr。
+lm_lr: 0.00001
+scheduler_conf:
+    warmup_steps: 500
+dtype: bf16
+
+freeze_video_dit: false
+
+# 每个 Wan temporal latent 对应一个 6.25Hz LLM video token。4x4 patch 将
+# 64x64 空间压成 16x16=256 token，在效果和实时速度之间取平衡。
+wan_locenc:
+    latent_channels: 16
+    latent_size: 64
+    patch_size: 4
+    hidden_dim: 384
+    num_layers: 2
+    num_heads: 6
+    ffn_ratio: 3.0
+
+# 轻量 local Video DiT。输入为 noisy/reference/previous 三张 latent 的通道拼接，
+# LLM hidden 与 flow timestep 通过 AdaLN-Zero 调制每一层。
+video_dit:
+    latent_channels: 16
+    latent_size: 64
+    patch_size: 4
+    hidden_dim: 512
+    num_layers: 8
+    num_heads: 8
+    ffn_ratio: 3.0
+    cond_dropout: 0.1
+
+# LLM/LocEnc teacher-force 全序列；每条长视频随机抽这些帧训练 DiT，限制显存。
+max_dit_frames_per_sample: 8
+
+
+run_name: "talker_vivid"
