@@ -418,9 +418,17 @@ def color_statistics_loss(prediction: torch.Tensor, reference: torch.Tensor) -> 
 
 
 class PatchDiscriminator(nn.Module):
-    def __init__(self, base_channels: int = 64, max_channels: int = 512):
+    def __init__(
+        self,
+        base_channels: int = 64,
+        max_channels: int = 512,
+        num_layers: int = 4,
+    ):
         super().__init__()
-        channels = [base_channels, base_channels * 2, base_channels * 4, max_channels]
+        if num_layers < 2:
+            raise ValueError("PatchDiscriminator num_layers must be at least 2")
+        channels = [min(base_channels * (2 ** index), max_channels)
+                    for index in range(num_layers)]
         layers: List[nn.Module] = []
         in_ch = 3
         for index, out_ch in enumerate(channels):
@@ -442,10 +450,17 @@ class PatchDiscriminator(nn.Module):
 
 
 class MultiScaleImageDiscriminator(nn.Module):
-    def __init__(self, scales: int = 2, base_channels: int = 64):
+    def __init__(
+        self,
+        scales: int = 2,
+        base_channels: int = 64,
+        max_channels: int = 512,
+        num_layers: int = 4,
+    ):
         super().__init__()
         self.discriminators = nn.ModuleList(
-            PatchDiscriminator(base_channels) for _ in range(scales)
+            PatchDiscriminator(base_channels, max_channels, num_layers)
+            for _ in range(scales)
         )
 
     def forward(self, x: torch.Tensor, return_features: bool = False):

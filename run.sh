@@ -46,10 +46,11 @@ rank=$2
 train_set="zh"
 echo ${num_nodes} ${rank}
 
-dir=exp/motion_tokenizer_256_mouthvel_normfix_from40k_no
+dir=exp/motion_tokenizer_512_large
 tensorboard_dir=${dir}/tensorboard
 num_workers=4
 prefetch=2
+motion_tokenizer_config=conf/motion_tokenizer_512_large.yaml
 
 train_engine=torch_ddp # torch_ddp deepspeed
 train_config=conf/run_stage1.yaml
@@ -104,7 +105,7 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
            --master_addr="10.126.203.172" \
            --master_port=54322 \
     twinlakes/bin/train_motion_tokenizer.py \
-      --config conf/motion_tokenizer_mouthvel.yaml > ${dir}/log/${rank}.log 2>&1
+      --config ${motion_tokenizer_config} > ${dir}/log/${rank}.log 2>&1
 fi
 
 if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then

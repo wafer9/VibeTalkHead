@@ -1,0 +1,130 @@
+# Native-512, approximately 200M-parameter clean motion autoencoder.
+#
+# This is a new end-to-end run: do not resume the old 21M/256 checkpoint.
+# The main 90k steps jointly train motion encoder, reference encoder and
+# renderer.  At 90k the corpus normalizer is finalized and the motion encoder
+# is frozen for a short 10k renderer calibration phase.
+seed: 2026
+output_dir: exp/motion_tokenizer_512_large
+resume: null
+
+data:
+  train_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/train.json
+  val_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/dev.json
+  video_root: /nfs-speech-cfs/wangzhou/s2s/vibehead/data/talker/shards
+  target_fps: 25
+  image_size: 512
+  clip_length: 4
+  batch_size: 1
+  val_batch_size: 1
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  max_retries: 12
+  max_train_samples: 0
+  max_val_samples: 0
+  first_frame_reference_prob: 0.5
+  photometric_strength: 0.08
+  horizontal_flip_prob: 0.5
+
+model:
+  # Keep the exported LLM/DiT target compact; scale spatial capacity instead.
+  motion_dim: 64
+  base_channels: 80
+  motion_blocks_per_stage: 3
+  reference_blocks_per_stage: 3
+  renderer_blocks_per_stage: 3
+  full_resolution_stage: true
+  full_resolution_channels: 80
+  gradient_checkpointing: true
+  motion_input_size: 512
+  causal_kernel_size: 5
+  causal_layers: 3
+
+training:
+  max_steps: 100000
+  warmup_steps: 2000
+  min_lr_ratio: 0.10
+  lr: 0.0001
+  motion_lr_multiplier: 1.0
+  discriminator_lr: 0.0001
+  betas: [0.9, 0.95]
+  discriminator_betas: [0.0, 0.99]
+  weight_decay: 0.01
+  # 16 GPUs gives an effective 128 clips / 512 target frames per update.
+  accumulation_steps: 8
+  grad_clip: 1.0
+  discriminator_grad_clip: 5.0
+  dtype: bf16
+  render_chunk: 1
+  freeze_motion_encoder: false
+  freeze_motion_after_normalizer: true
+  find_unused_parameters: false
+  log_interval: 20
+  preview_interval: 500
+  eval_interval: 1000
+  validation_batches: 8
+  # A full optimizer checkpoint is several GB for this model.
+  save_interval: 5000
+
+stages:
+  # Clean frame reconstruction first.  The image GAN is the only staged
+  # generation branch; temporal/noise/cross-ID tricks stay out of this run.
+  cross_identity_start: -1
+  image_gan_start: 10000
+  video_gan_start: -1
+  causal_start: -1
+  noise_start: -1
+
+  # Collect statistics only from the late, nearly converged encoder, then
+  # freeze it for the final renderer calibration window.
+  normalizer_start_step: 70000
+  normalizer_freeze_step: 90000
+
+loss:
+  # LIA-X-style simple objective: reconstruction + VGG + image GAN.
+  reconstruction: 1.0
+  perceptual: 0.10
+  image_adversarial: 0.10
+  feature_matching: 0.50
+
+  # Small representation/flow regularizers only; all targeted tricks are off.
+  flow_tv: 0.001
+  covariance: 0.001
+  motion_moment: 0.01
+  motion_target_std: 0.20
+
+  laplacian: 0.0
+  gradient: 0.0
+  region: 0.0
+  temporal_velocity: 0.0
+  temporal_acceleration: 0.0
+  mouth_landmark_velocity: 0.0
+  mouth_openness_velocity: 0.0
+  identity: 0.0
+  noisy_reconstruction: 0.0
+  noise_consistency: 0.0
+  noisy_temporal: 0.0
+  cross_motion_cycle: 0.0
+  cross_appearance: 0.0
+  cross_identity: 0.0
+  video_adversarial: 0.0
+
+  laplacian_levels: 4
+  max_perceptual_frames: 2
+  max_gan_frames: 2
+  vgg_weights_path: checkpoints/motion_tokenizer/vgg16-397923af.pth
+  identity_model_path: null
+  fan_weights_path: null
+  face_alignment_path: null
+
+image_discriminator:
+  # Native 512 / 256 / 128 PatchGAN views, about 20.9M parameters total.
+  scales: 3
+  base_channels: 64
+  max_channels: 512
+  num_layers: 5
+
+video_discriminator:
+  base_channels: 32
+  max_channels: 256

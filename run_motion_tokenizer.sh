@@ -4,8 +4,8 @@ set -euo pipefail
 source /data/joe/anaconda3/etc/profile.d/conda.sh
 conda activate vibe
 
-CONFIG="${CONFIG:-conf/motion_tokenizer.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-exp/motion_tokenizer_256}"
+CONFIG="${CONFIG:-conf/motion_tokenizer_512_large.yaml}"
+OUTPUT_DIR="${OUTPUT_DIR:-exp/motion_tokenizer_512_large}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 
 torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" \

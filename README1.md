@@ -575,3 +575,41 @@ CUDA_VISIBLE_DEVICES=0 python -m twinlakes.bin.reconstruct_motion_tokenizer \
 
 重建工具先对完整 latent 序列运行 causal adapter，再分块渲染并立即写视频，因此不会把几百帧 512p
 视频同时留在 CPU/GPU 内存里，也不会在 render chunk 边界重置 causal state。
+
+---
+
+## 方案更新：原生 512 Large 端到端 tokenizer
+
+此前“256 收敛后冻结 encoder，再做 512 renderer finetune”的方案已被实验结果否定：40k--45k
+虽然重建误差略降，但 motion encoder/normalizer 完全没有更新，44k 之后 Sync 也不再提升。新的主线改为
+直接从零训练原生 512、约 200M 参数的 clean warp-render autoencoder。
+
+配置：`conf/motion_tokenizer_512_large.yaml`
+
+- generator：198.86M，其中 motion encoder 49.90M、reference encoder 66.51M、renderer 82.41M；
+- motion latent 仍为 64D，容量增加集中在空间 encoder/renderer；
+- motion/reference/renderer 分别增加残差深度，并加入真正的 full-resolution render stage；
+- image discriminator 为 512/256/128 三尺度、5 层 PatchGAN，共 20.87M；
+- 0--90k 全部端到端训练，90k 固定 late-window normalizer 和 motion encoder，最后 10k 校准 renderer；
+- 主目标只保留 reconstruction、VGG、image GAN、feature matching，以及很小的 flow/latent 正则；
+- causal、structured noise、cross-ID、video GAN、landmark/velocity loss 在 clean 主训练中全部关闭。
+
+两机 16 卡沿用统一入口：
+
+```bash
+# master 节点
+bash run.sh 2 0
+
+# worker 节点
+bash run.sh 2 1
+```
+
+单机 8 卡：
+
+```bash
+bash run_motion_tokenizer.sh
+```
+
+默认每卡 `batch_size=1`、`clip_length=4`、累积 8 次；16 卡时每次 optimizer update 等效处理
+128 个 clip / 512 个 target frame。activation checkpointing 已启用，单卡真实数据 clean backward 的实测
+峰值显存约 5.83 GB；开启三尺度 GAN 的独立 G/D backward 也已通过。

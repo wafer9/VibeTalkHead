@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def _groups(channels: int) -> int:
@@ -57,20 +58,33 @@ class ResidualBlock(nn.Module):
 class MotionEncoder(nn.Module):
     """Frame-wise deterministic motion encoder."""
 
-    def __init__(self, motion_dim: int = 64, base_channels: int = 32):
+    def __init__(
+        self,
+        motion_dim: int = 64,
+        base_channels: int = 32,
+        blocks_per_stage: int = 2,
+        gradient_checkpointing: bool = False,
+    ):
         super().__init__()
+        if blocks_per_stage < 1:
+            raise ValueError("motion blocks_per_stage must be at least 1")
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         channels = [base_channels, base_channels * 2, base_channels * 4,
                     base_channels * 8, base_channels * 8]
         self.stem = ConvNormAct(3, channels[0], 7, 2)
-        blocks: List[nn.Module] = []
+        stages: List[nn.Module] = []
         in_ch = channels[0]
         for out_ch in channels[1:]:
-            blocks.extend([
-                ResidualBlock(in_ch, out_ch, downsample=True),
-                ResidualBlock(out_ch, out_ch),
-            ])
+            blocks: List[nn.Module] = [ResidualBlock(in_ch, out_ch, downsample=True)]
+            blocks.extend(
+                ResidualBlock(out_ch, out_ch)
+                for _ in range(blocks_per_stage - 1)
+            )
+            stages.append(nn.Sequential(*blocks))
             in_ch = out_ch
-        self.blocks = nn.Sequential(*blocks)
+        # Keep the historical flat key layout when blocks_per_stage=2 so old
+        # 256 checkpoints continue to load strictly.
+        self.blocks = nn.Sequential(*(block for stage in stages for block in stage))
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -83,14 +97,27 @@ class MotionEncoder(nn.Module):
         nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.blocks(self.stem(x)))
+        x = self.stem(x)
+        if self.gradient_checkpointing and self.training:
+            x = checkpoint(self.blocks, x, use_reentrant=False)
+        else:
+            x = self.blocks(x)
+        return self.head(x)
 
 
 class ReferenceEncoder(nn.Module):
     """Appearance-only spatial pyramid, evaluated once per generated video."""
 
-    def __init__(self, base_channels: int = 32, blocks_per_stage: int = 1):
+    def __init__(
+        self,
+        base_channels: int = 32,
+        blocks_per_stage: int = 1,
+        gradient_checkpointing: bool = False,
+    ):
         super().__init__()
+        if blocks_per_stage < 0:
+            raise ValueError("reference blocks_per_stage must be non-negative")
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         channels = [base_channels, base_channels * 2, base_channels * 4,
                     base_channels * 8, base_channels * 8]
         self.channels = channels
@@ -110,7 +137,10 @@ class ReferenceEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
         features = [self.stem(x)]
         for stage in self.stages:
-            features.append(stage(features[-1]))
+            if self.gradient_checkpointing and self.training:
+                features.append(checkpoint(stage, features[-1], use_reentrant=False))
+            else:
+                features.append(stage(features[-1]))
         return features  # fine -> coarse, H/2 ... H/32
 
 
@@ -189,8 +219,10 @@ def warp(x: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
 
 class FlowRenderStage(nn.Module):
     def __init__(self, in_ch: int, ref_ch: int, out_ch: int, motion_dim: int,
-                 max_flow: float, upsample: bool):
+                 max_flow: float, upsample: bool, blocks_per_stage: int = 2):
         super().__init__()
+        if blocks_per_stage < 2:
+            raise ValueError("renderer blocks_per_stage must be at least 2")
         self.upsample = upsample
         self.max_flow = max_flow
         self.up = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
@@ -199,6 +231,10 @@ class FlowRenderStage(nn.Module):
         self.motion_bias = nn.Linear(motion_dim, out_ch)
         self.block1 = FiLMResidualBlock(out_ch, motion_dim)
         self.block2 = FiLMResidualBlock(out_ch, motion_dim)
+        self.extra_blocks = nn.ModuleList(
+            FiLMResidualBlock(out_ch, motion_dim)
+            for _ in range(blocks_per_stage - 2)
+        )
         self.flow_head = nn.Sequential(
             nn.GroupNorm(_groups(out_ch), out_ch), nn.SiLU(),
             nn.Conv2d(out_ch, 2, 3, 1, 1),
@@ -236,14 +272,26 @@ class FlowRenderStage(nn.Module):
         warped_ref = self.ref_proj(warped_ref)
         h = self.pre(torch.cat([h, warped_ref], dim=1))
         h = self.block2(self.block1(h, motion), motion)
+        for block in self.extra_blocks:
+            h = block(h, motion)
         mask = torch.sigmoid(self.mask_head(h))
         h = mask * warped_ref + (1.0 - mask) * h
         return h, flow, mask
 
 
 class SourceAnchoredRenderer(nn.Module):
-    def __init__(self, ref_channels: Sequence[int], motion_dim: int = 64):
+    def __init__(
+        self,
+        ref_channels: Sequence[int],
+        motion_dim: int = 64,
+        blocks_per_stage: int = 2,
+        full_resolution_stage: bool = False,
+        full_resolution_channels: Optional[int] = None,
+        gradient_checkpointing: bool = False,
+    ):
         super().__init__()
+        self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.full_resolution_stage = bool(full_resolution_stage)
         # Work coarse -> fine. Normalized flow limits become finer by scale.
         decoder_channels = list(reversed(ref_channels))
         reference_channels = list(reversed(ref_channels))
@@ -255,10 +303,21 @@ class SourceAnchoredRenderer(nn.Module):
             stages.append(FlowRenderStage(
                 in_ch, ref_ch, out_ch, motion_dim,
                 max_flow=max_flows[index], upsample=index > 0,
+                blocks_per_stage=blocks_per_stage,
             ))
             in_ch = out_ch
         self.stages = nn.ModuleList(stages)
-        final_ch = decoder_channels[-1]
+        self.full_stage: Optional[FlowRenderStage]
+        if self.full_resolution_stage:
+            full_ch = int(full_resolution_channels or decoder_channels[-1])
+            self.full_stage = FlowRenderStage(
+                in_ch, 3, full_ch, motion_dim, max_flow=0.025, upsample=True,
+                blocks_per_stage=blocks_per_stage,
+            )
+            final_ch = full_ch
+        else:
+            self.full_stage = None
+            final_ch = decoder_channels[-1]
         self.to_render = nn.Sequential(
             ConvNormAct(final_ch, final_ch),
             nn.Conv2d(final_ch, 3, 3, 1, 1),
@@ -284,11 +343,20 @@ class SourceAnchoredRenderer(nn.Module):
         masks = []
         flows = []
         for stage, ref in zip(self.stages, reversed(reference_features)):
-            h, flow, mask = stage(h, ref, motion, flow)
+            h, flow, mask = self._run_stage(stage, h, ref, motion, flow)
             masks.append(mask)
             flows.append(flow)
 
-        h = F.interpolate(h, size=reference_rgb.shape[-2:], mode="bilinear", align_corners=False)
+        if self.full_stage is not None:
+            h, flow, mask = self._run_stage(
+                self.full_stage, h, reference_rgb, motion, flow
+            )
+            masks.append(mask)
+            flows.append(flow)
+        else:
+            h = F.interpolate(
+                h, size=reference_rgb.shape[-2:], mode="bilinear", align_corners=False
+            )
         render = torch.tanh(self.to_render(h))
         final_mask = torch.sigmoid(self.to_mask(h))
         final_flow = F.interpolate(flow, size=reference_rgb.shape[-2:], mode="bilinear", align_corners=False)
@@ -301,6 +369,25 @@ class SourceAnchoredRenderer(nn.Module):
             "pyramid_flows": flows,
             "pyramid_masks": masks,
         }
+
+    def _run_stage(
+        self,
+        stage: FlowRenderStage,
+        h: torch.Tensor,
+        reference: torch.Tensor,
+        motion: torch.Tensor,
+        flow: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.gradient_checkpointing or not self.training:
+            return stage(h, reference, motion, flow)
+        if flow is None:
+            return checkpoint(
+                lambda a, b, c: stage(a, b, c, None),
+                h, reference, motion, use_reentrant=False,
+            )
+        return checkpoint(
+            stage, h, reference, motion, flow, use_reentrant=False
+        )
 
 
 class MotionNormalizer(nn.Module):
@@ -385,7 +472,12 @@ class MotionTokenizer(nn.Module):
         self,
         motion_dim: int = 64,
         base_channels: int = 32,
+        motion_blocks_per_stage: int = 2,
         reference_blocks_per_stage: int = 1,
+        renderer_blocks_per_stage: int = 2,
+        full_resolution_stage: bool = False,
+        full_resolution_channels: Optional[int] = None,
+        gradient_checkpointing: bool = False,
         motion_input_size: int = 256,
         causal_kernel_size: int = 5,
         causal_layers: int = 3,
@@ -393,10 +485,23 @@ class MotionTokenizer(nn.Module):
         super().__init__()
         self.motion_dim = motion_dim
         self.motion_input_size = motion_input_size
-        self.motion_encoder = MotionEncoder(motion_dim, base_channels)
-        self.reference_encoder = ReferenceEncoder(base_channels, reference_blocks_per_stage)
+        self.motion_encoder = MotionEncoder(
+            motion_dim, base_channels, motion_blocks_per_stage,
+            gradient_checkpointing=gradient_checkpointing,
+        )
+        self.reference_encoder = ReferenceEncoder(
+            base_channels, reference_blocks_per_stage,
+            gradient_checkpointing=gradient_checkpointing,
+        )
         self.motion_adapter = CausalMotionBlock(motion_dim, causal_kernel_size, causal_layers)
-        self.renderer = SourceAnchoredRenderer(self.reference_encoder.channels, motion_dim)
+        self.renderer = SourceAnchoredRenderer(
+            self.reference_encoder.channels,
+            motion_dim,
+            blocks_per_stage=renderer_blocks_per_stage,
+            full_resolution_stage=full_resolution_stage,
+            full_resolution_channels=full_resolution_channels,
+            gradient_checkpointing=gradient_checkpointing,
+        )
         self.normalizer = MotionNormalizer(motion_dim)
 
     def encode_motion(self, image: torch.Tensor) -> torch.Tensor:

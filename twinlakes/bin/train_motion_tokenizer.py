@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=None, help="override per-rank batch size")
     parser.add_argument("--render_chunk", type=int, default=None, help="override renderer micro-chunk")
     parser.add_argument("--log_interval", type=int, default=None, help="override logging interval")
+    parser.add_argument(
+        "--skip_final_save", action="store_true",
+        help="skip the terminal checkpoint (intended for smoke tests only)",
+    )
     return parser.parse_args()
 
 
@@ -96,7 +100,11 @@ def setup_distributed() -> Tuple[int, int, int, torch.device]:
     else:
         device = torch.device("cpu")
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+        backend = "nccl" if device.type == "cuda" else "gloo"
+        if backend == "nccl":
+            dist.init_process_group(backend, device_id=device)
+        else:
+            dist.init_process_group(backend)
     return rank, local_rank, world_size, device
 
 
@@ -195,20 +203,36 @@ def compute_generator_losses(
 ) -> Dict[str, torch.Tensor]:
     reconstruction = output["reconstruction"]
     losses: Dict[str, torch.Tensor] = {}
+    zero = reconstruction.new_zeros(())
     losses["reconstruction"] = charbonnier(reconstruction, target)
-    losses["laplacian"] = laplacian(reconstruction, target)
-    losses["gradient"] = gradient_loss(reconstruction, target)
-    losses["region"] = region_weighted_loss(reconstruction, target)
-    velocity, acceleration = temporal_relation_loss(reconstruction, target)
-    losses["temporal_velocity"] = velocity
-    losses["temporal_acceleration"] = acceleration
+    losses["laplacian"] = (
+        laplacian(reconstruction, target)
+        if float(loss_config.get("laplacian", 0.0)) != 0 else zero
+    )
+    losses["gradient"] = (
+        gradient_loss(reconstruction, target)
+        if float(loss_config.get("gradient", 0.0)) != 0 else zero
+    )
+    losses["region"] = (
+        region_weighted_loss(reconstruction, target)
+        if float(loss_config.get("region", 0.0)) != 0 else zero
+    )
+    if (
+        float(loss_config.get("temporal_velocity", 0.0)) != 0
+        or float(loss_config.get("temporal_acceleration", 0.0)) != 0
+    ):
+        velocity, acceleration = temporal_relation_loss(reconstruction, target)
+        losses["temporal_velocity"] = velocity
+        losses["temporal_acceleration"] = acceleration
+    else:
+        losses["temporal_velocity"] = zero
+        losses["temporal_acceleration"] = zero
     if mouth_velocity.enabled and (
         float(loss_config.get("mouth_landmark_velocity", 0.0)) != 0
         or float(loss_config.get("mouth_openness_velocity", 0.0)) != 0
     ):
         losses.update(mouth_velocity(reconstruction, target))
     else:
-        zero = reconstruction.new_zeros(())
         losses.update({
             "mouth_landmark_velocity": zero,
             "mouth_openness_velocity": zero,
@@ -217,14 +241,23 @@ def compute_generator_losses(
             "mouth_input_grad_norm": zero,
             "mouth_input_grad_clipped": zero,
         })
-    losses["flow_tv"] = flow_total_variation(output["flow"])
-    losses["covariance"] = covariance_loss(output["target_motion"])
-    motion_samples = torch.cat([
-        output["reference_motion"][:, None], output["target_motion"]
-    ], dim=1)
-    losses["motion_moment"] = motion_moment_loss(
-        motion_samples, float(loss_config.get("motion_target_std", 0.20))
+    losses["flow_tv"] = (
+        flow_total_variation(output["flow"])
+        if float(loss_config.get("flow_tv", 0.0)) != 0 else zero
     )
+    losses["covariance"] = (
+        covariance_loss(output["target_motion"])
+        if float(loss_config.get("covariance", 0.0)) != 0 else zero
+    )
+    if float(loss_config.get("motion_moment", 0.0)) != 0:
+        motion_samples = torch.cat([
+            output["reference_motion"][:, None], output["target_motion"]
+        ], dim=1)
+        losses["motion_moment"] = motion_moment_loss(
+            motion_samples, float(loss_config.get("motion_target_std", 0.20))
+        )
+    else:
+        losses["motion_moment"] = zero
     perceptual_weight = float(loss_config.get("perceptual", 0.0))
     if perceptual.enabled and perceptual_weight != 0:
         prediction_frames = reconstruction.flatten(0, 1)
@@ -582,22 +615,40 @@ def main() -> None:
 
     dtype = training.get("dtype", "bf16")
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == "fp16")
-    laplacian = LaplacianPyramidLoss(int(config["loss"].get("laplacian_levels", 4))).to(device)
-    perceptual = LocalVGGPerceptualLoss(config["loss"].get("vgg_weights_path")).to(device)
-    identity = TorchScriptIdentityLoss(config["loss"].get("identity_model_path")).to(device)
+    loss_config = config["loss"]
+    laplacian = LaplacianPyramidLoss(int(loss_config.get("laplacian_levels", 4))).to(device)
+    perceptual_enabled = float(loss_config.get("perceptual", 0.0)) != 0
+    identity_enabled = (
+        float(loss_config.get("identity", 0.0)) != 0
+        or float(loss_config.get("cross_identity", 0.0)) != 0
+    )
+    mouth_enabled = (
+        float(loss_config.get("mouth_landmark_velocity", 0.0)) != 0
+        or float(loss_config.get("mouth_openness_velocity", 0.0)) != 0
+    )
+    perceptual = LocalVGGPerceptualLoss(
+        loss_config.get("vgg_weights_path") if perceptual_enabled else None
+    ).to(device)
+    identity = TorchScriptIdentityLoss(
+        loss_config.get("identity_model_path") if identity_enabled else None
+    ).to(device)
     mouth_velocity = FrozenFANMouthVelocityLoss(
-        config["loss"].get("fan_weights_path"),
-        package_path=config["loss"].get("face_alignment_path"),
-        temperature=float(config["loss"].get("fan_softargmax_temperature", 20.0)),
-        confidence_threshold=float(config["loss"].get("fan_confidence_threshold", 0.20)),
-        smooth_l1_beta=float(config["loss"].get("mouth_velocity_beta", 0.01)),
-        use_checkpoint=bool(config["loss"].get("fan_gradient_checkpoint", True)),
-        input_grad_max_norm=float(config["loss"].get("fan_input_grad_max_norm", 0.02)),
+        loss_config.get("fan_weights_path") if mouth_enabled else None,
+        package_path=loss_config.get("face_alignment_path"),
+        temperature=float(loss_config.get("fan_softargmax_temperature", 20.0)),
+        confidence_threshold=float(loss_config.get("fan_confidence_threshold", 0.20)),
+        smooth_l1_beta=float(loss_config.get("mouth_velocity_beta", 0.01)),
+        use_checkpoint=bool(loss_config.get("fan_gradient_checkpoint", True)),
+        input_grad_max_norm=float(loss_config.get("fan_input_grad_max_norm", 0.02)),
     ).to(device)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None,
-                    broadcast_buffers=False, find_unused_parameters=True)
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            broadcast_buffers=False,
+            find_unused_parameters=bool(training.get("find_unused_parameters", True)),
+        )
         if image_discriminator is not None:
             image_discriminator = DDP(
                 image_discriminator, device_ids=[local_rank] if device.type == "cuda" else None
@@ -645,6 +696,7 @@ def main() -> None:
     accum_steps = int(training.get("accumulation_steps", 1))
     max_steps = int(training["max_steps"])
     normalizer_step = int(config["stages"].get("normalizer_freeze_step", -1))
+    normalizer_start = int(config["stages"].get("normalizer_start_step", 0))
     causal_start = int(config["stages"].get("causal_start", -1))
     cross_start = int(config["stages"].get("cross_identity_start", -1))
     image_gan_start = int(config["stages"].get("image_gan_start", -1))
@@ -718,12 +770,13 @@ def main() -> None:
                 generator_loss = losses["total"] / accum_steps
             scaler.scale(generator_loss).backward()
 
-            # Corpus stats include reference and target frames and stop changing
-            # exactly when the configured normalizer phase begins.
-            raw.normalizer.update(torch.cat([
-                output["reference_motion"].detach()[:, None],
-                output["target_motion"].detach(),
-            ], dim=1))
+            # Corpus stats use only the configured late-training window, so
+            # early encoder drift does not contaminate the exported scale.
+            if step >= normalizer_start:
+                raw.normalizer.update(torch.cat([
+                    output["reference_motion"].detach()[:, None],
+                    output["target_motion"].detach(),
+                ], dim=1))
 
             discriminator_losses = {"total": target.new_zeros(())}
             if discriminator_optimizer is not None and (image_gan_active or video_gan_active):
@@ -827,15 +880,15 @@ def main() -> None:
         epoch += 1
 
     barrier()
-    if rank == 0:
+    if rank == 0 and not args.skip_final_save:
         save_checkpoint(
             os.path.join(output_dir, f"step_{step:09d}.pt"),
             model, image_discriminator, video_discriminator,
             generator_optimizer, discriminator_optimizer, scaler,
             step, epoch, config,
         )
-        if writer is not None:
-            writer.close()
+    if rank == 0 and writer is not None:
+        writer.close()
     barrier()
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
