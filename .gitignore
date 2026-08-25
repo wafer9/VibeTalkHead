@@ -8,11 +8,15 @@ __pycache__/
 # Local training outputs and model artifacts
 exp/
 tensorboard/
+checkpoints/
+data/
+outputs/
 *.pt
 *.ptz
+*.pth
 *.ckpt
 *.safetensors
+*.idx.npy
 
 # Editor/OS noise
 .DS_Store
-

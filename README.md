@@ -45,38 +45,42 @@ LLM hidden state 预测 `z_t`，避免当前帧信息泄漏。
 每个自回归时刻生成一张 `[16,64,64]` latent：
 
 ```
-noisy z_t [16,64,64] -----+
-reference z_0 [16,64,64] -+-> channel concat [48,64,64]
-previous z_{t-1}          -+-> 4x4 patchify -> 256 tokens
-                                      |
-LLM hidden h_{t-1} + flow timestep -> AdaLN-Zero
-                                      |
-                              8-layer / dim-512 DiT
-                                      |
-                         unpatchify -> velocity [16,64,64]
+diffusion timestep ---------------------> 1 time token
+LLM hidden h_{t-1} --------------------> 1 LLM token
+reference z_0 -- 8x8 patchify ----------> 64 reference tokens
+noisy z_t ----- 4x4 patchify ----------> 256 noisy tokens
+                                              |
+             concat -> 322-token bidirectional Transformer
+                                              |
+                      只取最后 256 个 noisy positions
+                                              |
+                         unpatchify -> v-prediction [16,64,64]
 ```
 
-reference 通过空间对齐的 channel concat 保持身份与背景；previous latent 保持局部纹理和
-运动连续性；LLM hidden 负责长历史、语音驱动和高层动作。单个 hidden token 不做长度为 1
-的 cross-attention，而是与 flow timestep 相加后调制每个 DiT block 的 attention/FFN。
+reference 通过 64 个空间 prefix token 保持身份与背景；previous latent 不直接进入 DiT，
+历史帧只经 WanLocEnc 和因果 LLM 传递。LLM hidden 负责长历史、语音驱动和高层动作。单个 hidden token 不做长度为 1
+的 cross-attention，而是与 diffusion timestep 相加后调制每个 DiT block 的 attention/FFN。
 
-训练目标采用 rectified flow / CFM：
+训练目标复用 VibeVoice 的 noise scheduler 和 v-prediction：
 
 ```
-noise ~ N(0,I), t ~ U(0,1)
-z_t_noisy = (1-t) * noise + t * target
-velocity_target = target - noise
-loss = MSE(VideoDiT(z_t_noisy, t, conditions), velocity_target)
+noise ~ N(0,I), timestep ~ Uniform({0, ..., num_train_timesteps-1})
+z_t_noisy = noise_scheduler.add_noise(target, noise, timestep)
+velocity_target = noise_scheduler.get_velocity(target, noise, timestep)
+diffusion_loss = MSE(VideoDiT(z_t_noisy, t, llm_cond), velocity_target)
+uncond_diffusion_loss = MSE(VideoDiT(z_t_noisy, t, llm_without_audio), velocity_target)
+loss = 0.8 * diffusion_loss + 0.2 * uncond_diffusion_loss
 ```
 
-推理从高斯噪声出发，默认 8 步 Euler；CFG 只丢弃 LLM hidden，reference 与 previous
-在条件/无条件分支中保持一致。
+reference 不作为 LLM token；条件/无条件 LLM 分支都保留 teacher-forced video token，
+两者唯一区别是 audio pad 是否填入音频特征。DiT 的两路都使用相同的首帧 WAN reference。
+推理从高斯噪声出发，使用同一个 VibeVoice DPM-Solver；CFG 合并有音频和空音频两路预测。
 
 ### 实时与显存策略
 
 - `patch=4` 将全注意力长度从 1024 降到 256，理论 attention 矩阵缩小 16 倍。
 - DiT 默认 8 层、hidden 512，不复制 SoulX Pro 的 30 层/1536 维大模型。
-- 一个 batch 内所有抽中的视频帧并行执行一次 CFM forward，不按时间逐帧调用 DiT。
+- 一个 batch 内所有抽中的视频帧并行执行 diffusion forward，不按时间逐帧调用 DiT。
 - LLM 和 LocEnc 仍 teacher-force 完整序列；DiT 对每条长视频随机抽 8 帧计算 loss，避免
   显存随视频时长线性膨胀，跨 epoch 覆盖全部帧。
 - 预训练 LLM 默认学习率 `1e-5`，新建 LocEnc/VideoDiT 默认 `1e-4`，避免同一高学习率
@@ -86,8 +90,8 @@ loss = MSE(VideoDiT(z_t_noisy, t, conditions), velocity_target)
 
 核心代码：
 
-- `twinlakes/models/video_dit.py`：WanLocEnc、AdaLN-Zero Video DiT、patchify/unpatchify。
-- `twinlakes/models/rq_transformer.py`：音频/视频 embedding 回填、因果 shift、CFM loss 和单帧采样。
+- `twinlakes/models/video_dit.py`：WanLocEnc、双向 prefix-token Video DiT、reference/noisy 双尺度 patchify/unpatchify；训练使用 VibeVoice 的 v-prediction noise scheduler，推理使用对应 DPM-Solver。
+- `twinlakes/models/rq_transformer.py`：音频/视频 embedding 回填、因果 shift、VibeVoice diffusion loss 和单帧采样。
 - `twinlakes/dataset/processor.py`：`train.json` 音频与量化 Wan latent 加载、变长 batch padding。
 - `conf/run_stage1.yaml`：实时版默认模型规模。
 

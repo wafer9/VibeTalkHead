@@ -46,7 +46,7 @@ rank=$2
 train_set="zh"
 echo ${num_nodes} ${rank}
 
-dir=exp/s5_1p7_all_semantic
+dir=exp/motion_tokenizer_256_mouthvel_normfix_from40k_no
 tensorboard_dir=${dir}/tensorboard
 num_workers=4
 prefetch=2
@@ -103,11 +103,27 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
            --node_rank=$rank \
            --master_addr="10.126.203.172" \
            --master_port=54322 \
+    twinlakes/bin/train_motion_tokenizer.py \
+      --config conf/motion_tokenizer_mouthvel.yaml > ${dir}/log/${rank}.log 2>&1
+fi
+
+if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
+  echo "Start finetune"
+  mkdir -p ${dir}/log
+  num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
+  dist_backend="nccl"
+
+  echo "$0: num_nodes is $num_nodes, proc_per_node is $num_gpus"
+  torchrun --nnodes=$num_nodes \
+           --nproc_per_node=$num_gpus \
+           --node_rank=$rank \
+           --master_addr="10.126.203.172" \
+           --master_port=54322 \
     twinlakes/bin/train.py \
       --config $train_config \
       --data_type "raw" \
-      --train_data data/talker/train_talker_vivid.json  \
-      --cv_data data/talker/dev.json  \
+      --train_data data/talker_vivid/train.json  \
+      --cv_data data/talker_vivid/dev.json  \
       --model_dir $dir \
       --tensorboard_dir ${tensorboard_dir} \
       --ddp.dist_backend $dist_backend \
@@ -118,4 +134,3 @@ fi
 
 # data/vivi/train_liax.json
 # data/talker/train.json
-

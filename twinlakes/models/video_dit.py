@@ -122,26 +122,28 @@ class WanLocEnc(nn.Module):
         return x.reshape(b, t, -1) if restore else x
 
 
-class VideoDiTBlock(nn.Module):
+class PrefixVideoDiTBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, ffn_ratio: float):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm1 = nn.LayerNorm(dim)
         self.attn = SelfAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim)
         self.ffn = FeedForward(dim, int(dim * ffn_ratio))
-        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = \
-            self.modulation(cond).unsqueeze(1).chunk(6, dim=-1)
-        y = self.norm1(x) * (1 + scale_a) + shift_a
-        x = x + gate_a * self.attn(y)
-        y = self.norm2(x) * (1 + scale_f) + shift_f
-        return x + gate_f * self.ffn(y)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # No causal mask: time/LLM/reference prefix tokens and noisy spatial
+        # tokens communicate bidirectionally, as in VoxCPM LocalDiT.
+        x = x + self.attn(self.norm1(x))
+        return x + self.ffn(self.norm2(x))
 
 
 class RealtimeVideoDiT(nn.Module):
-    """Predict a WAN-frame flow velocity from noise, reference, history and LLM state."""
+    """Bidirectional prefix-token DiT for one WAN temporal latent slice.
+
+    Token layout is ``[time, LLM, reference patches, noisy patches]``.  Unlike
+    AdaLN conditioning, the audio-aware LLM state is an ordinary Transformer
+    token visible to every noisy patch from the first training step.
+    """
 
     def __init__(
         self,
@@ -149,6 +151,7 @@ class RealtimeVideoDiT(nn.Module):
         latent_channels: int = 16,
         latent_size: int = 64,
         patch_size: int = 4,
+        reference_patch_size: int = 8,
         hidden_dim: int = 512,
         num_layers: int = 8,
         num_heads: int = 8,
@@ -157,38 +160,56 @@ class RealtimeVideoDiT(nn.Module):
     ):
         super().__init__()
         assert latent_size % patch_size == 0
+        assert latent_size % reference_patch_size == 0
         self.latent_channels = latent_channels
         self.patch_size = patch_size
+        self.reference_patch_size = reference_patch_size
         self.cond_dropout = cond_dropout
         grid = latent_size // patch_size
+        reference_grid = latent_size // reference_patch_size
 
-        # noisy target + fixed identity reference + previous generated frame
-        self.patch_embed = nn.Conv2d(
-            latent_channels * 3, hidden_dim, kernel_size=patch_size, stride=patch_size
+        self.noisy_patch_embed = nn.Conv2d(
+            latent_channels, hidden_dim, kernel_size=patch_size, stride=patch_size
         )
-        self.row_embed = nn.Parameter(torch.randn(1, grid, 1, hidden_dim) * 0.02)
-        self.col_embed = nn.Parameter(torch.randn(1, 1, grid, hidden_dim) * 0.02)
+        self.reference_patch_embed = nn.Conv2d(
+            latent_channels,
+            hidden_dim,
+            kernel_size=reference_patch_size,
+            stride=reference_patch_size,
+        )
+        self.noisy_row_embed = nn.Parameter(torch.randn(1, grid, 1, hidden_dim) * 0.02)
+        self.noisy_col_embed = nn.Parameter(torch.randn(1, 1, grid, hidden_dim) * 0.02)
+        self.reference_row_embed = nn.Parameter(
+            torch.randn(1, reference_grid, 1, hidden_dim) * 0.02
+        )
+        self.reference_col_embed = nn.Parameter(
+            torch.randn(1, 1, reference_grid, hidden_dim) * 0.02
+        )
+        # time / LLM / reference / noisy segment identifiers.
+        self.token_type_embed = nn.Parameter(torch.randn(4, hidden_dim) * 0.02)
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
+        # Qwen's final hidden state is already normalized.  A second
+        # LayerNorm would remove cond/uncond differences represented by mean
+        # or magnitude, so use a learnable MLP directly.
         self.llm_proj = nn.Sequential(
-            nn.LayerNorm(llm_dim), nn.Linear(llm_dim, hidden_dim)
+            nn.Linear(llm_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        self.blocks = nn.ModuleList([
-            VideoDiTBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(num_layers)
-        ])
-        self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
-        self.final_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, 2 * hidden_dim))
+        self.llm_gain = nn.Parameter(torch.tensor(1.0))
+        self.blocks = nn.ModuleList(
+            [PrefixVideoDiTBlock(hidden_dim, num_heads, ffn_ratio) for _ in range(num_layers)]
+        )
+        self.final_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, latent_channels * patch_size * patch_size)
-        self._init_adaln_zero()
+        self._init_output()
 
-    def _init_adaln_zero(self):
-        for block in self.blocks:
-            nn.init.zeros_(block.modulation[-1].weight)
-            nn.init.zeros_(block.modulation[-1].bias)
-        nn.init.zeros_(self.final_mod[-1].weight)
-        nn.init.zeros_(self.final_mod[-1].bias)
-        nn.init.zeros_(self.out_proj.weight)
+    def _init_output(self):
+        # Close-to-zero initial v-prediction without blocking gradients to the
+        # prefix decoder (strict zero would block them on the first step).
+        nn.init.normal_(self.out_proj.weight, std=1e-3)
         nn.init.zeros_(self.out_proj.bias)
 
     def forward(
@@ -197,26 +218,48 @@ class RealtimeVideoDiT(nn.Module):
         timestep: torch.Tensor,
         hidden: torch.Tensor,
         reference: torch.Tensor,
-        previous: torch.Tensor,
         drop_condition: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """All latent arguments are [N,16,64,64]; hidden is [N,H]."""
+        """Latent arguments are [N,16,64,64]; hidden is [N,H]."""
         if drop_condition is None and self.training and self.cond_dropout > 0:
             drop_condition = torch.rand(hidden.shape[0], device=hidden.device) < self.cond_dropout
         if drop_condition is not None:
             hidden = hidden.masked_fill(drop_condition[:, None], 0)
 
-        x = self.patch_embed(torch.cat([noisy, reference, previous], dim=1))
-        gh, gw = x.shape[-2:]
-        pos = (self.row_embed[:, :gh] + self.col_embed[:, :, :gw]).reshape(1, gh * gw, -1)
-        x = x.flatten(2).transpose(1, 2) + pos.to(dtype=x.dtype)
-        cond = self.time_mlp(timestep_embedding(timestep, x.shape[-1]).to(dtype=x.dtype))
-        cond = cond + self.llm_proj(hidden)
+        noisy_tokens = self.noisy_patch_embed(noisy)
+        gh, gw = noisy_tokens.shape[-2:]
+        noisy_pos = (
+            self.noisy_row_embed[:, :gh] + self.noisy_col_embed[:, :, :gw]
+        ).reshape(1, gh * gw, -1)
+        noisy_tokens = noisy_tokens.flatten(2).transpose(1, 2)
+        noisy_tokens = noisy_tokens + noisy_pos.to(dtype=noisy_tokens.dtype)
+        noisy_tokens = noisy_tokens + self.token_type_embed[3].to(dtype=noisy_tokens.dtype)
+
+        reference_tokens = self.reference_patch_embed(reference)
+        rh, rw = reference_tokens.shape[-2:]
+        reference_pos = (
+            self.reference_row_embed[:, :rh] + self.reference_col_embed[:, :, :rw]
+        ).reshape(1, rh * rw, -1)
+        reference_tokens = reference_tokens.flatten(2).transpose(1, 2)
+        reference_tokens = reference_tokens + reference_pos.to(dtype=reference_tokens.dtype)
+        reference_tokens = reference_tokens + self.token_type_embed[2].to(
+            dtype=reference_tokens.dtype
+        )
+
+        time_token = self.time_mlp(
+            timestep_embedding(timestep, noisy_tokens.shape[-1]).to(dtype=noisy_tokens.dtype)
+        )
+        time_token = time_token + self.token_type_embed[0].to(dtype=time_token.dtype)
+        llm_token = self.llm_gain.to(dtype=noisy_tokens.dtype) * self.llm_proj(hidden)
+        llm_token = llm_token + self.token_type_embed[1].to(dtype=llm_token.dtype)
+
+        x = torch.cat(
+            [time_token.unsqueeze(1), llm_token.unsqueeze(1), reference_tokens, noisy_tokens],
+            dim=1,
+        )
         for block in self.blocks:
-            x = block(x, cond)
-        shift, scale = self.final_mod(cond).unsqueeze(1).chunk(2, dim=-1)
-        x = self.out_proj(self.final_norm(x) * (1 + scale) + shift)
+            x = block(x)
+        x = self.out_proj(self.final_norm(x[:, -gh * gw:]))
         p, c = self.patch_size, self.latent_channels
         x = x.reshape(x.shape[0], gh, gw, p, p, c)
         return x.permute(0, 5, 1, 3, 2, 4).reshape(x.shape[0], c, gh * p, gw * p)
-

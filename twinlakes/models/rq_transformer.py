@@ -1,4 +1,4 @@
-"""Causal audio/visual LM with a realtime local WAN-frame flow head."""
+"""Causal audio/visual LM with a realtime WAN-frame diffusion head."""
 
 import logging
 from typing import Dict, List, Optional
@@ -11,6 +11,7 @@ from vibevoice.modular.configuration_vibevoice import VibeVoiceConfig
 from vibevoice.modular.modeling_vibevoice import SpeechConnector
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.modular.modular_vibevoice_text_tokenizer import VibeVoiceTextTokenizerFast
+from vibevoice.schedule.dpm_solver import DPMSolverMultistepScheduler
 from twinlakes.models.video_dit import RealtimeVideoDiT, WanLocEnc
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class LMMConfig(PretrainedConfig):
 
 
 class LMModel(nn.Module):
-    """Use an LLM for temporal planning and a small CFM DiT for WAN frames."""
+    """Use an LLM for temporal planning and a small diffusion DiT for WAN frames."""
 
     def __init__(
         self,
@@ -51,6 +52,7 @@ class LMModel(nn.Module):
         acoustic_connector: SpeechConnector,
         video_connector: WanLocEnc,
         video_dit: RealtimeVideoDiT,
+        noise_scheduler: DPMSolverMultistepScheduler,
         tokenizer,
         speech_scaling_factor: torch.Tensor,
         speech_bias_factor: torch.Tensor,
@@ -63,6 +65,7 @@ class LMModel(nn.Module):
         self.acoustic_connector = acoustic_connector
         self.video_connector = video_connector
         self.video_dit = video_dit
+        self.noise_scheduler = noise_scheduler
         self.tokenizer = tokenizer
         self.max_dit_frames_per_sample = max_dit_frames_per_sample
         self.register_buffer("speech_scaling_factor", speech_scaling_factor)
@@ -111,11 +114,18 @@ class LMModel(nn.Module):
             latent_channels=dit.get("latent_channels", 16),
             latent_size=dit.get("latent_size", 64),
             patch_size=dit.get("patch_size", 4),
+            reference_patch_size=dit.get("reference_patch_size", 8),
             hidden_dim=dit.get("hidden_dim", 512),
             num_layers=dit.get("num_layers", 8),
             num_heads=dit.get("num_heads", 8),
             ffn_ratio=dit.get("ffn_ratio", 3.0),
             cond_dropout=dit.get("cond_dropout", 0.1),
+        )
+        diffusion_config = vibevoice.config.diffusion_head_config
+        noise_scheduler = DPMSolverMultistepScheduler(
+            num_train_timesteps=diffusion_config.ddpm_num_steps,
+            beta_schedule=diffusion_config.ddpm_beta_schedule,
+            prediction_type=diffusion_config.prediction_type,
         )
         model = cls(
             config=vibevoice.config,
@@ -124,6 +134,7 @@ class LMModel(nn.Module):
             acoustic_connector=acoustic_connector,
             video_connector=video_connector,
             video_dit=video_dit,
+            noise_scheduler=noise_scheduler,
             tokenizer=tokenizer,
             speech_scaling_factor=vibevoice.speech_scaling_factor,
             speech_bias_factor=vibevoice.speech_bias_factor,
@@ -194,10 +205,13 @@ class LMModel(nn.Module):
                 )
             )
 
-        # Reference occupies the first <|image_pad|>; GT targets are teacher-forced.
-        x[:, 0] = self.video_connector(video_latents[:, 0])
+        # Conditional/unconditional LLM inputs differ only at audio positions.
+        # The first-frame WAN reference is a DiT spatial condition and is not
+        # injected into either LLM branch.
+        uncond_x = x.clone()
         x[audio_mask] = audio_features[audio_valid]
         x[video_input_mask] = video_embeddings
+        uncond_x[video_input_mask] = video_embeddings
         attention_mask = valid_ids.to(torch.long)
         outputs = self.lm.model(
             inputs_embeds=x,
@@ -205,7 +219,14 @@ class LMModel(nn.Module):
             use_cache=False,
             return_dict=True,
         )
+        uncond_outputs = self.lm.model(
+            inputs_embeds=uncond_x,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
         conditions = outputs.last_hidden_state[video_loss_mask]
+        uncond_conditions = uncond_outputs.last_hidden_state[video_loss_mask]
 
         # The LLM/LocEnc sees the complete teacher-forced sequence, while the
         # expensive denoiser trains on a random subset of frames from each clip.
@@ -222,55 +243,92 @@ class LMModel(nn.Module):
                     selected[row, keep] = True
         selected_among_valid = selected[target_valid]
         conditions = conditions[selected_among_valid]
+        uncond_conditions = uncond_conditions[selected_among_valid]
 
         targets = targets_padded[selected]
-        previous_padded = video_latents[:, :-1]
-        previous = previous_padded[selected]
         batch_index = torch.arange(video_latents.shape[0], device=video_latents.device)
         batch_index = batch_index[:, None].expand_as(selected)[selected]
         reference = video_latents[:, 0][batch_index]
 
-        # Rectified-flow/CFM target. All valid frames are trained in one DiT batch.
+        # VibeVoice diffusion objective (v-prediction), applied to WAN frames.
+        # Conditional and audio-empty unconditional branches share exactly the
+        # same target/noise/timestep so their losses and later CFG are aligned.
         noise = torch.randn_like(targets)
-        t = torch.rand(targets.shape[0], device=targets.device, dtype=torch.float32)
-        noisy = (1 - t[:, None, None, None]) * noise + t[:, None, None, None] * targets
-        target_velocity = targets - noise
-        prediction = self.video_dit(noisy, t, conditions, reference, previous)
-        flow_loss = torch.nn.functional.mse_loss(
+        timesteps = torch.randint(
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (targets.shape[0],),
+            device=targets.device,
+            dtype=torch.long,
+        )
+        noisy = self.noise_scheduler.add_noise(targets, noise, timesteps)
+        target_velocity = self.noise_scheduler.get_velocity(targets, noise, timesteps)
+        dit_timesteps = timesteps.to(dtype=targets.dtype)
+        keep_condition = torch.zeros(
+            targets.shape[0], device=targets.device, dtype=torch.bool
+        )
+        prediction = self.video_dit(
+            noisy, dit_timesteps, conditions, reference,
+            drop_condition=keep_condition,
+        )
+        uncond_prediction = self.video_dit(
+            noisy, dit_timesteps, uncond_conditions, reference,
+            drop_condition=keep_condition,
+        )
+        diffusion_loss = torch.nn.functional.mse_loss(
             prediction.float(), target_velocity.float(), reduction="mean"
         )
-        return {"loss": flow_loss, "flow_loss": flow_loss, "diffusion_loss": flow_loss}
+        uncond_diffusion_loss = torch.nn.functional.mse_loss(
+            uncond_prediction.float(), target_velocity.float(), reduction="mean"
+        )
+        loss = diffusion_loss * 0.8 + uncond_diffusion_loss * 0.2
+        return {
+            "loss": loss,
+            "diffusion_loss": diffusion_loss,
+            "uncond_diffusion_loss": uncond_diffusion_loss,
+        }
 
     @torch.no_grad()
     def sample_video_frame(
         self,
         hidden: torch.Tensor,
         reference: torch.Tensor,
-        previous: torch.Tensor,
         num_steps: int = 8,
         cfg_scale: float = 1.5,
         generator: Optional[torch.Generator] = None,
+        uncond_hidden: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Euler-sample one [B,16,64,64] frame from CFM noise."""
+        """DPM-Solver sample one [B,16,64,64] WAN frame."""
         b = hidden.shape[0]
         z = torch.randn(
             b, 16, 64, 64, device=hidden.device, dtype=hidden.dtype, generator=generator
         )
-        dt = 1.0 / num_steps
+        self.noise_scheduler.set_timesteps(num_steps, device=hidden.device)
         do_cfg = cfg_scale != 1.0
-        for step in range(num_steps):
-            t = torch.full((b,), (step + 0.5) * dt, device=z.device, dtype=torch.float32)
+        if do_cfg and uncond_hidden is None:
+            uncond_hidden = torch.zeros_like(hidden)
+        keep_condition = torch.zeros(
+            b * (2 if do_cfg else 1), device=hidden.device, dtype=torch.bool
+        )
+        for timestep in self.noise_scheduler.timesteps:
             if do_cfg:
                 z_in = torch.cat([z, z], dim=0)
-                h_in = torch.cat([hidden, torch.zeros_like(hidden)], dim=0)
+                h_in = torch.cat([hidden, uncond_hidden], dim=0)
                 ref_in = torch.cat([reference, reference], dim=0)
-                prev_in = torch.cat([previous, previous], dim=0)
-                velocity = self.video_dit(z_in, t.repeat(2), h_in, ref_in, prev_in)
-                cond, uncond = velocity.chunk(2)
-                velocity = uncond + cfg_scale * (cond - uncond)
+                t_in = timestep.expand(2 * b).to(dtype=z.dtype)
+                model_output = self.video_dit(
+                    z_in, t_in, h_in, ref_in,
+                    drop_condition=keep_condition,
+                )
+                cond_output, uncond_output = model_output.chunk(2)
+                model_output = uncond_output + cfg_scale * (cond_output - uncond_output)
             else:
-                velocity = self.video_dit(z, t, hidden, reference, previous)
-            z = z + dt * velocity
+                t_in = timestep.expand(b).to(dtype=z.dtype)
+                model_output = self.video_dit(
+                    z, t_in, hidden, reference,
+                    drop_condition=keep_condition,
+                )
+            z = self.noise_scheduler.step(model_output, timestep, z).prev_sample
         return z
 
     @torch.no_grad()
@@ -305,29 +363,41 @@ class LMModel(nn.Module):
             video_start.append(v_s)
         if int(audio_mask.sum()) != int(audio_valid.sum()):
             raise ValueError("audio prompt/encoder length mismatch during generation")
-        x[:, 0] = self.video_connector(reference)
-        x[audio_mask] = audio_features[audio_valid]
+        cond_x = x.clone()
+        uncond_x = x.clone()
+        cond_x[audio_mask] = audio_features[audio_valid]
 
+        do_cfg = cfg_scale != 1.0
+        prefill_x = torch.cat([cond_x, uncond_x], dim=0) if do_cfg else cond_x
+        prefill_mask = (
+            torch.cat([valid_ids, valid_ids], dim=0) if do_cfg else valid_ids
+        ).to(torch.long)
         out = self.lm.model(
-            inputs_embeds=x,
-            attention_mask=valid_ids.to(torch.long),
+            inputs_embeds=prefill_x,
+            attention_mask=prefill_mask,
             use_cache=True,
             return_dict=True,
         )
         past = out.past_key_values
-        rows = torch.arange(x.shape[0], device=x.device)
-        h = out.last_hidden_state[rows, torch.tensor(video_start, device=x.device)]
+        batch_size = x.shape[0]
+        rows = torch.arange(prefill_x.shape[0], device=x.device)
+        starts = torch.tensor(video_start, device=x.device)
+        starts = starts.repeat(2) if do_cfg else starts
+        h = out.last_hidden_state[rows, starts]
 
-        previous = reference
         generated = [reference]
         for frame_index in range(num_frames):
+            cond_h = h[:batch_size]
+            uncond_h = h[batch_size:] if do_cfg else None
             frame = self.sample_video_frame(
-                h, reference, previous, num_steps, cfg_scale, generator
+                cond_h, reference, num_steps, cfg_scale, generator,
+                uncond_hidden=uncond_h,
             )
             generated.append(frame)
-            previous = frame
             if frame_index + 1 < num_frames:
                 frame_token = self.video_connector(frame).unsqueeze(1)
+                if do_cfg:
+                    frame_token = frame_token.repeat(2, 1, 1)
                 out = self.lm.model(
                     inputs_embeds=frame_token,
                     past_key_values=past,

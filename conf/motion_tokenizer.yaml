@@ -1,0 +1,110 @@
+# Phase A: learn the 64-D deterministic motion tokenizer at 256x256.
+seed: 2026
+output_dir: exp/motion_tokenizer_256
+resume: null
+
+data:
+  train_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/train.json
+  val_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/dev.json
+  video_root: /nfs-speech-cfs/wangzhou/s2s/vibehead/data/talker/shards
+  target_fps: 25
+  image_size: 256
+  clip_length: 16
+  batch_size: 8
+  val_batch_size: 1
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  max_retries: 12
+  max_train_samples: 0
+  max_val_samples: 0
+  first_frame_reference_prob: 0.5
+  photometric_strength: 0.12
+  horizontal_flip_prob: 0.5
+
+model:
+  motion_dim: 64
+  base_channels: 32
+  reference_blocks_per_stage: 1
+  motion_input_size: 256
+  causal_kernel_size: 5
+  causal_layers: 3
+
+training:
+  # Rounded batch-8 schedule: simple stage boundaries are easier to monitor
+  # and still provide a large sample budget with 16-GPU training.
+  max_steps: 50000
+  warmup_steps: 1000
+  min_lr_ratio: 0.05
+  lr: 0.0002
+  motion_lr_multiplier: 1.0
+  discriminator_lr: 0.0002
+  betas: [0.9, 0.95]
+  discriminator_betas: [0.0, 0.99]
+  weight_decay: 0.01
+  accumulation_steps: 2
+  grad_clip: 1.0
+  discriminator_grad_clip: 5.0
+  dtype: bf16
+  # Renderer expands reference features only this many frames at once.
+  render_chunk: 4
+  freeze_motion_after_normalizer: true
+  log_interval: 20
+  preview_interval: 500
+  eval_interval: 1000
+  validation_batches: 8
+  save_interval: 1000
+
+stages:
+  # Cross-ID cycle is useful before the motion encoder is frozen.
+  cross_identity_start: 10000
+  image_gan_start: 15000
+  video_gan_start: 20000
+  # Finalize corpus statistics and stop updating E_m at the same boundary.
+  normalizer_freeze_step: 25000
+  causal_start: 25000
+  causal_ramp_steps: 5000
+  # Robust renderer fine-tuning only begins with frozen normalization.
+  noise_start: 30000
+  noise_ramp_steps: 5000
+  max_noise_sigma: 0.10
+  noise_mode: mixed
+
+loss:
+  reconstruction: 1.0
+  laplacian: 1.0
+  gradient: 0.20
+  region: 0.50
+  temporal_velocity: 0.50
+  temporal_acceleration: 0.20
+  flow_tv: 0.01
+  covariance: 0.001
+  # Fix the raw 64-D coordinate gauge before corpus normalization is frozen.
+  motion_moment: 0.01
+  motion_target_std: 0.20
+  # Prepared by: python tools/prepare_motion_tokenizer_weights.py
+  perceptual: 0.10
+  max_perceptual_frames: 4
+  vgg_weights_path: checkpoints/motion_tokenizer/vgg16-397923af.pth
+  identity: 0.10
+  identity_model_path: checkpoints/motion_tokenizer/arcface_w600k_r50.ts
+  noisy_reconstruction: 1.0
+  noise_consistency: 0.20
+  noisy_temporal: 0.50
+  cross_motion_cycle: 0.20
+  cross_appearance: 0.05
+  cross_identity: 0.10
+  image_adversarial: 0.05
+  feature_matching: 0.50
+  video_adversarial: 0.05
+  laplacian_levels: 4
+  max_gan_frames: 8
+  video_gan_size: 128
+
+image_discriminator:
+  scales: 2
+  base_channels: 64
+
+video_discriminator:
+  base_channels: 32
+  max_channels: 256

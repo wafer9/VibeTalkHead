@@ -34,9 +34,9 @@ accum_grad: 2
 max_epoch: 50
 log_interval: 100
 optim_conf:
-    lr: 0.0001
+    lr: 0.001
 # 预训练 LLM 用更小学习率；LocEnc/VideoDiT/acoustic connector 使用 optim_conf.lr。
-lm_lr: 0.00001
+lm_lr: 0.001
 scheduler_conf:
     warmup_steps: 500
 dtype: bf16
@@ -54,20 +54,23 @@ wan_locenc:
     num_heads: 6
     ffn_ratio: 3.0
 
-# 轻量 local Video DiT。输入为 noisy/reference/previous 三张 latent 的通道拼接，
-# LLM hidden 与 flow timestep 通过 AdaLN-Zero 调制每一层。
+# Prefix-token local Video DiT：[time, LLM, reference patches, noisy patches]。
+# reference patch=8 得到 64 tokens，noisy patch=4 得到 256 tokens。
 video_dit:
     latent_channels: 16
     latent_size: 64
     patch_size: 4
-    hidden_dim: 512
+    reference_patch_size: 8
+    hidden_dim: 768
     num_layers: 8
-    num_heads: 8
+    num_heads: 12
     ffn_ratio: 3.0
-    cond_dropout: 0.1
+    # CFG 的 uncondition 由 forward 中独立的“空音频 LLM 分支”提供，
+    # 不再随机把 DiT hidden 置零。
+    cond_dropout: 0.0
 
 # LLM/LocEnc teacher-force 全序列；每条长视频随机抽这些帧训练 DiT，限制显存。
-max_dit_frames_per_sample: 8
+max_dit_frames_per_sample: 24
 
 
 run_name: "talker_vivid"
