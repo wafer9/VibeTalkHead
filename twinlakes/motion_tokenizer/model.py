@@ -1,10 +1,9 @@
-"""Strict two-branch motion autoencoder.
+"""LIA-X-style feature-warp motion autoencoder.
 
-The target frame is allowed to enter the renderer only through a compact motion
-vector.  All spatial appearance features come from a single cached reference
-image.  This is intentionally different from the original LIA-X shared style
-space: the structural separation is what makes the exported code useful as an
-identity-agnostic target for an audio-conditioned generative model.
+Source and target frames share one encoder.  Motion coefficients steer a
+multi-scale flow renderer; motion-refined generated features and warped source
+features are mask-fused before learned RGB synthesis.  The output has no
+raw-RGB blending shortcut.
 """
 
 from __future__ import annotations
@@ -144,6 +143,22 @@ class ReferenceEncoder(nn.Module):
         return features  # fine -> coarse, H/2 ... H/32
 
 
+class SharedLatentHead(nn.Module):
+    """LIA-X-like source style extracted from the shared feature encoder."""
+
+    def __init__(self, channels: int, style_dim: int):
+        super().__init__()
+        self.down = ResidualBlock(channels, channels, downsample=True)
+        self.projection = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(channels, style_dim),
+        )
+
+    def forward(self, coarse_feature: torch.Tensor) -> torch.Tensor:
+        return self.projection(self.down(coarse_feature))
+
+
 class FiLMResidualBlock(nn.Module):
     def __init__(self, channels: int, motion_dim: int):
         super().__init__()
@@ -169,6 +184,25 @@ class FiLMResidualBlock(nn.Module):
         h = self._modulate(self.norm2(h), self.affine2, motion)
         h = self.conv2(F.silu(h))
         return (x + h) * (2.0 ** -0.5)
+
+
+class OrthogonalMotionDictionary(nn.Module):
+    """LIA-X-style orthogonal directions mapping coefficients to renderer style."""
+
+    def __init__(self, style_dim: int, motion_dim: int):
+        super().__init__()
+        if style_dim < motion_dim:
+            raise ValueError(
+                f"style_dim must be >= motion_dim, got {style_dim} < {motion_dim}"
+            )
+        self.weight = nn.Parameter(torch.randn(style_dim, motion_dim))
+
+    def forward(self, coefficient: torch.Tensor) -> torch.Tensor:
+        # Reduced QR gives motion_dim unit, mutually orthogonal directions in
+        # the larger renderer-style space.  Multiplication supports both
+        # [B,D] and [B,T,D] coefficient tensors.
+        direction = torch.linalg.qr(self.weight.float(), mode="reduced").Q
+        return coefficient @ direction.to(coefficient).transpose(0, 1)
 
 
 class CausalMotionBlock(nn.Module):
@@ -227,7 +261,6 @@ class FlowRenderStage(nn.Module):
         self.max_flow = max_flow
         self.up = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
         self.ref_proj = nn.Conv2d(ref_ch, out_ch, 1)
-        self.pre = nn.Conv2d(out_ch * 2, out_ch, 3, 1, 1)
         self.motion_bias = nn.Linear(motion_dim, out_ch)
         self.block1 = FiLMResidualBlock(out_ch, motion_dim)
         self.block2 = FiLMResidualBlock(out_ch, motion_dim)
@@ -243,10 +276,11 @@ class FlowRenderStage(nn.Module):
             nn.GroupNorm(_groups(out_ch), out_ch), nn.SiLU(),
             nn.Conv2d(out_ch, 1, 3, 1, 1),
         )
-        nn.init.zeros_(self.flow_head[-1].weight)
+        # A zero-initialized flow head would block its first-step motion
+        # gradient.  A small random head starts near identity while keeping
+        # motion-conditioned warping trainable immediately.
+        nn.init.normal_(self.flow_head[-1].weight, std=0.01)
         nn.init.zeros_(self.flow_head[-1].bias)
-        nn.init.zeros_(self.mask_head[-1].weight)
-        nn.init.constant_(self.mask_head[-1].bias, 1.0)
 
     def forward(
         self,
@@ -259,6 +293,15 @@ class FlowRenderStage(nn.Module):
             h = F.interpolate(h, size=ref.shape[-2:], mode="bilinear", align_corners=False)
         h = self.up(h)
         h = h + self.motion_bias(motion)[:, :, None, None]
+
+        # Refine the generated branch with motion before predicting either
+        # flow or visibility.  This prevents flow/mask from being decided by
+        # an under-conditioned feature and matches the ordering of LIA-X's
+        # StyledConv -> ToFlow path.
+        h = self.block2(self.block1(h, motion), motion)
+        for block in self.extra_blocks:
+            h = block(h, motion)
+
         if flow is None:
             flow = torch.zeros(
                 h.shape[0], 2, h.shape[-2], h.shape[-1],
@@ -268,15 +311,56 @@ class FlowRenderStage(nn.Module):
             flow = F.interpolate(flow, size=h.shape[-2:], mode="bilinear", align_corners=False)
         residual_flow = torch.tanh(self.flow_head(h)) * self.max_flow
         flow = flow + residual_flow
-        warped_ref = warp(ref, flow)
-        warped_ref = self.ref_proj(warped_ref)
-        h = self.pre(torch.cat([h, warped_ref], dim=1))
-        h = self.block2(self.block1(h, motion), motion)
-        for block in self.extra_blocks:
-            h = block(h, motion)
         mask = torch.sigmoid(self.mask_head(h))
-        h = mask * warped_ref + (1.0 - mask) * h
-        return h, flow, mask
+
+        warped_ref = self.ref_proj(warp(ref, flow))
+        warped_feature = warped_ref * mask
+        generated_feature = h * (1.0 - mask)
+        fused_feature = warped_feature + generated_feature
+
+        # Both the next flow stage and the RGB synthesis path see the same
+        # fused feature.  This retains the reference warp while giving ToRGB a
+        # direct learned branch for mouth interiors, teeth, eyelids, etc.
+        return fused_feature, flow, mask
+
+
+class FeatureRGBStage(nn.Module):
+    """Refine one fused feature scale and accumulate an RGB skip."""
+
+    def __init__(self, channels: int, previous_channels: Optional[int], blocks: int):
+        super().__init__()
+        if blocks < 1:
+            raise ValueError("rgb_blocks_per_stage must be at least 1")
+        self.previous = (
+            nn.Conv2d(previous_channels, channels, 3, 1, 1)
+            if previous_channels is not None else None
+        )
+        self.blocks = nn.Sequential(
+            *(ResidualBlock(channels, channels) for _ in range(blocks))
+        )
+        self.to_rgb = nn.Conv2d(channels, 3, 1)
+        nn.init.normal_(self.to_rgb.weight, std=0.01)
+        nn.init.zeros_(self.to_rgb.bias)
+
+    def forward(
+        self,
+        fused_feature: torch.Tensor,
+        previous_feature: Optional[torch.Tensor],
+        previous_rgb: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = fused_feature
+        if previous_feature is not None:
+            previous_feature = F.interpolate(
+                previous_feature, size=h.shape[-2:], mode="bilinear", align_corners=False
+            )
+            h = (h + self.previous(previous_feature)) * (2.0 ** -0.5)
+        h = self.blocks(h)
+        rgb = self.to_rgb(h)
+        if previous_rgb is not None:
+            rgb = rgb + F.interpolate(
+                previous_rgb, size=rgb.shape[-2:], mode="bilinear", align_corners=False
+            )
+        return h, rgb
 
 
 class SourceAnchoredRenderer(nn.Module):
@@ -288,6 +372,7 @@ class SourceAnchoredRenderer(nn.Module):
         full_resolution_stage: bool = False,
         full_resolution_channels: Optional[int] = None,
         gradient_checkpointing: bool = False,
+        rgb_blocks_per_stage: int = 2,
     ):
         super().__init__()
         self.gradient_checkpointing = bool(gradient_checkpointing)
@@ -298,6 +383,7 @@ class SourceAnchoredRenderer(nn.Module):
         max_flows = [0.20, 0.15, 0.10, 0.075, 0.05]
         self.input = nn.Linear(motion_dim, decoder_channels[0] * 4 * 4)
         stages = []
+        stage_channels = []
         in_ch = decoder_channels[0]
         for index, (ref_ch, out_ch) in enumerate(zip(reference_channels, decoder_channels)):
             stages.append(FlowRenderStage(
@@ -306,6 +392,7 @@ class SourceAnchoredRenderer(nn.Module):
                 blocks_per_stage=blocks_per_stage,
             ))
             in_ch = out_ch
+            stage_channels.append(out_ch)
         self.stages = nn.ModuleList(stages)
         self.full_stage: Optional[FlowRenderStage]
         if self.full_resolution_stage:
@@ -314,20 +401,17 @@ class SourceAnchoredRenderer(nn.Module):
                 in_ch, 3, full_ch, motion_dim, max_flow=0.025, upsample=True,
                 blocks_per_stage=blocks_per_stage,
             )
-            final_ch = full_ch
+            stage_channels.append(full_ch)
         else:
             self.full_stage = None
-            final_ch = decoder_channels[-1]
-        self.to_render = nn.Sequential(
-            ConvNormAct(final_ch, final_ch),
-            nn.Conv2d(final_ch, 3, 3, 1, 1),
-        )
-        self.to_mask = nn.Sequential(
-            ConvNormAct(final_ch, final_ch),
-            nn.Conv2d(final_ch, 1, 3, 1, 1),
-        )
-        nn.init.zeros_(self.to_mask[-1].weight)
-        nn.init.constant_(self.to_mask[-1].bias, 1.5)
+        previous = None
+        rgb_stages = []
+        for channels in stage_channels:
+            rgb_stages.append(FeatureRGBStage(
+                channels, previous, blocks=int(rgb_blocks_per_stage)
+            ))
+            previous = channels
+        self.rgb_stages = nn.ModuleList(rgb_stages)
 
     def forward(
         self,
@@ -340,32 +424,43 @@ class SourceAnchoredRenderer(nn.Module):
         h = self.input(motion).reshape(batch, -1, 4, 4)
         h = F.interpolate(h, size=coarse_size, mode="bilinear", align_corners=False)
         flow = None
-        masks = []
         flows = []
+        masks = []
+        fused_features = []
         for stage, ref in zip(self.stages, reversed(reference_features)):
             h, flow, mask = self._run_stage(stage, h, ref, motion, flow)
-            masks.append(mask)
             flows.append(flow)
+            masks.append(mask)
+            fused_features.append(h)
 
         if self.full_stage is not None:
             h, flow, mask = self._run_stage(
                 self.full_stage, h, reference_rgb, motion, flow
             )
-            masks.append(mask)
             flows.append(flow)
+            masks.append(mask)
+            fused_features.append(h)
         else:
             h = F.interpolate(
                 h, size=reference_rgb.shape[-2:], mode="bilinear", align_corners=False
             )
-        render = torch.tanh(self.to_render(h))
-        final_mask = torch.sigmoid(self.to_mask(h))
-        final_flow = F.interpolate(flow, size=reference_rgb.shape[-2:], mode="bilinear", align_corners=False)
-        warped_rgb = warp(reference_rgb, final_flow)
-        image = final_mask * warped_rgb + (1.0 - final_mask) * render
+        final_flow = F.interpolate(
+            flow, size=reference_rgb.shape[-2:], mode="bilinear", align_corners=False
+        )
+        rgb_feature = None
+        rgb = None
+        for rgb_stage, fused_feature in zip(self.rgb_stages, fused_features):
+            rgb_feature, rgb = rgb_stage(fused_feature, rgb_feature, rgb)
+        if rgb.shape[-2:] != reference_rgb.shape[-2:]:
+            rgb = F.interpolate(
+                rgb, size=reference_rgb.shape[-2:], mode="bilinear",
+                align_corners=False,
+            )
+        image = torch.tanh(rgb)
         return {
             "image": image,
             "flow": final_flow,
-            "mask": final_mask,
+            "mask": masks[-1],
             "pyramid_flows": flows,
             "pyramid_masks": masks,
         }
@@ -435,6 +530,13 @@ class MotionNormalizer(nn.Module):
     def denormalize(self, motion: torch.Tensor) -> torch.Tensor:
         return motion * self.std.to(motion) + self.mean.to(motion)
 
+    def normalize_delta(self, delta: torch.Tensor) -> torch.Tensor:
+        """Scale a reference-relative delta while preserving its zero origin."""
+        return delta / self.std.to(delta)
+
+    def denormalize_delta(self, token: torch.Tensor) -> torch.Tensor:
+        return token * self.std.to(token)
+
 
 def structured_motion_noise(x: torch.Tensor, max_sigma: float, mode: str = "mixed") -> torch.Tensor:
     """Add DiT-like errors in normalized motion coordinates."""
@@ -481,28 +583,85 @@ class MotionTokenizer(nn.Module):
         motion_input_size: int = 256,
         causal_kernel_size: int = 5,
         causal_layers: int = 3,
+        shared_motion_encoder: bool = False,
+        liax_coefficient_mode: bool = False,
+        renderer_style_dim: Optional[int] = None,
+        orthogonal_motion_dictionary: bool = False,
+        rgb_blocks_per_stage: int = 2,
     ):
         super().__init__()
         self.motion_dim = motion_dim
         self.motion_input_size = motion_input_size
-        self.motion_encoder = MotionEncoder(
-            motion_dim, base_channels, motion_blocks_per_stage,
-            gradient_checkpointing=gradient_checkpointing,
-        )
+        self.shared_motion_encoder = bool(shared_motion_encoder)
+        self.liax_coefficient_mode = bool(liax_coefficient_mode)
         self.reference_encoder = ReferenceEncoder(
             base_channels, reference_blocks_per_stage,
             gradient_checkpointing=gradient_checkpointing,
         )
+        if self.shared_motion_encoder:
+            style_dim = int(renderer_style_dim or self.reference_encoder.channels[-1])
+            self.motion_encoder = None
+            self.shared_latent_head = SharedLatentHead(
+                self.reference_encoder.channels[-1], style_dim
+            )
+            self.motion_head = nn.Linear(style_dim, motion_dim)
+            nn.init.normal_(self.motion_head.weight, std=0.01)
+            nn.init.zeros_(self.motion_head.bias)
+        else:
+            style_dim = int(renderer_style_dim or motion_dim)
+            self.motion_encoder = MotionEncoder(
+                motion_dim, base_channels, motion_blocks_per_stage,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+            self.shared_latent_head = None
+            self.motion_head = None
+        if self.liax_coefficient_mode:
+            if self.shared_latent_head is None:
+                self.reference_style_head = SharedLatentHead(
+                    self.reference_encoder.channels[-1], style_dim
+                )
+            else:
+                self.reference_style_head = None
+            self.motion_dictionary = (
+                OrthogonalMotionDictionary(style_dim, motion_dim)
+                if orthogonal_motion_dictionary
+                else nn.Linear(motion_dim, style_dim, bias=False)
+            )
+            renderer_motion_dim = style_dim
+        else:
+            self.reference_style_head = None
+            self.motion_dictionary = None
+            renderer_motion_dim = motion_dim
         self.motion_adapter = CausalMotionBlock(motion_dim, causal_kernel_size, causal_layers)
         self.renderer = SourceAnchoredRenderer(
             self.reference_encoder.channels,
-            motion_dim,
+            renderer_motion_dim,
             blocks_per_stage=renderer_blocks_per_stage,
             full_resolution_stage=full_resolution_stage,
             full_resolution_channels=full_resolution_channels,
             gradient_checkpointing=gradient_checkpointing,
+            rgb_blocks_per_stage=rgb_blocks_per_stage,
         )
         self.normalizer = MotionNormalizer(motion_dim)
+
+    def motion_parameters(self):
+        """Parameters that must stop moving after token normalization freezes."""
+        if self.shared_motion_encoder:
+            yield from self.reference_encoder.parameters()
+            yield from self.shared_latent_head.parameters()
+            yield from self.motion_head.parameters()
+        else:
+            yield from self.motion_encoder.parameters()
+
+    def set_motion_encoder_requires_grad(self, requires_grad: bool) -> None:
+        for parameter in self.motion_parameters():
+            parameter.requires_grad_(requires_grad)
+
+    def _shared_style_and_motion(
+        self, features: Sequence[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        style = self.shared_latent_head(features[-1])
+        return style, self.motion_head(style)
 
     def encode_motion(self, image: torch.Tensor) -> torch.Tensor:
         if image.shape[-2:] != (self.motion_input_size, self.motion_input_size):
@@ -510,7 +669,32 @@ class MotionTokenizer(nn.Module):
                 image, size=(self.motion_input_size, self.motion_input_size),
                 mode="bilinear", align_corners=False, antialias=True,
             )
+        if self.shared_motion_encoder:
+            _, motion = self._shared_style_and_motion(self.reference_encoder(image))
+            return motion
         return self.motion_encoder(image)
+
+    def _reference_style(
+        self, reference_features: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
+        if self.shared_motion_encoder:
+            return self.shared_latent_head(reference_features[-1])
+        return self.reference_style_head(reference_features[-1])
+
+    def _renderer_motion(
+        self,
+        reference_features: Sequence[torch.Tensor],
+        reference_motion: torch.Tensor,
+        delta: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.liax_coefficient_mode:
+            return delta
+        # Training uses the absolute canonical coefficient A_t.  The exported
+        # token remains the first-frame-relative delta, so inference recovers
+        # A_t as A_ref + delta before applying the shared direction dictionary.
+        target_coefficient = reference_motion[:, None] + delta
+        reference_style = self._reference_style(reference_features)
+        return reference_style[:, None] + self.motion_dictionary(target_coefficient)
 
     @staticmethod
     def _expand_reference(x: torch.Tensor, count: int) -> torch.Tensor:
@@ -522,14 +706,20 @@ class MotionTokenizer(nn.Module):
         reference_features: Sequence[torch.Tensor],
         delta: torch.Tensor,
         render_chunk: int,
+        reference_motion: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch, time, _ = delta.shape
         images, flows, masks = [], [], []
+        if reference_motion is None:
+            reference_motion = self.encode_motion(reference)
+        renderer_motion = self._renderer_motion(
+            reference_features, reference_motion, delta
+        )
         render_chunk = time if render_chunk <= 0 else render_chunk
         for start in range(0, time, render_chunk):
             stop = min(time, start + render_chunk)
             count = stop - start
-            motion = delta[:, start:stop].reshape(batch * count, -1)
+            motion = renderer_motion[:, start:stop].reshape(batch * count, -1)
             ref_rgb = self._expand_reference(reference, count)
             ref_feats = [self._expand_reference(feature, count) for feature in reference_features]
             result = self.renderer(ref_rgb, ref_feats, motion)
@@ -555,34 +745,42 @@ class MotionTokenizer(nn.Module):
         return_clean_with_noise: bool = True,
     ) -> Dict[str, torch.Tensor]:
         batch, time = frames.shape[:2]
-        reference_motion = self.encode_motion(reference)
-        target_motion = self.encode_motion(frames.flatten(0, 1)).reshape(batch, time, -1)
-        clean_delta = target_motion - reference_motion[:, None]
-        clean_delta = self.motion_adapter(clean_delta, causal_strength)
         reference_features = self.reference_encoder(reference)
+        if self.shared_motion_encoder:
+            _, reference_motion = self._shared_style_and_motion(reference_features)
+        else:
+            reference_motion = self.encode_motion(reference)
+        target_motion = self.encode_motion(frames.flatten(0, 1)).reshape(batch, time, -1)
+        motion_delta = target_motion - reference_motion[:, None]
+        adapted_delta = self.motion_adapter(motion_delta, causal_strength)
 
         clean_render = self._render_sequence(
-            reference, reference_features, clean_delta, render_chunk
+            reference, reference_features, adapted_delta, render_chunk,
+            reference_motion=reference_motion,
         )
+        motion_token = self.normalizer.normalize_delta(motion_delta)
         output: Dict[str, torch.Tensor] = {
             "reconstruction": clean_render["image"],
             "flow": clean_render["flow"],
             "mask": clean_render["mask"],
             "reference_motion": reference_motion,
             "target_motion": target_motion,
-            "normalized_motion": self.normalizer.normalize(target_motion),
+            "motion_delta": motion_delta,
+            "motion_token": motion_token,
+            # Backward-compatible name; its semantics are now explicitly delta.
+            "normalized_motion": motion_token,
         }
 
         if noise_sigma > 0:
             if not bool(self.normalizer.ready.item()):
                 raise RuntimeError("motion normalizer must be finalized before noise training")
-            normalized = self.normalizer.normalize(target_motion)
+            normalized = self.normalizer.normalize_delta(motion_delta)
             noisy_normalized = structured_motion_noise(normalized, noise_sigma, noise_mode)
-            noisy_motion = self.normalizer.denormalize(noisy_normalized)
-            noisy_delta = noisy_motion - reference_motion[:, None]
+            noisy_delta = self.normalizer.denormalize_delta(noisy_normalized)
             noisy_delta = self.motion_adapter(noisy_delta, causal_strength)
             noisy_render = self._render_sequence(
-                reference, reference_features, noisy_delta, render_chunk
+                reference, reference_features, noisy_delta, render_chunk,
+                reference_motion=reference_motion,
             )
             output["noisy_reconstruction"] = noisy_render["image"]
             output["noisy_flow"] = noisy_render["flow"]
@@ -594,21 +792,30 @@ class MotionTokenizer(nn.Module):
 
         if cross_reference is not None:
             cross_features = self.reference_encoder(cross_reference)
-            cross_reference_motion = self.encode_motion(cross_reference)
+            if self.shared_motion_encoder:
+                _, cross_reference_motion = self._shared_style_and_motion(cross_features)
+            else:
+                cross_reference_motion = self.encode_motion(cross_reference)
             # One random-ish central frame is enough for the expensive cycle branch.
             selected_motion = target_motion[:, time // 2]
-            cross_target_delta = selected_motion - cross_reference_motion
+            if self.liax_coefficient_mode:
+                # Transfer the original reference-relative motion change onto
+                # the cross reference baseline, matching LIA-X inference.
+                cross_target_delta = motion_delta[:, time // 2]
+            else:
+                cross_target_delta = selected_motion - cross_reference_motion
             adapted_cross_delta = self.motion_adapter(
                 cross_target_delta[:, None], causal_strength
             )
             cross_render = self._render_sequence(
-                cross_reference, cross_features, adapted_cross_delta, render_chunk=1
+                cross_reference, cross_features, adapted_cross_delta, render_chunk=1,
+                reference_motion=cross_reference_motion,
             )["image"][:, 0]
             cross_cycle_motion = self.encode_motion(cross_render)
             # Compare changes relative to the same cross reference.  The two
             # cross_reference_motion terms make the cycle gradient invariant to
-            # a common encoder offset, while preserving the absolute target-pose
-            # semantics used by rendering and exported motion codes.
+            # a common encoder offset while preserving the reference-relative
+            # semantics used by rendering.
             cross_cycle_delta = cross_cycle_motion - cross_reference_motion
             output.update({
                 "cross_reconstruction": cross_render,
@@ -629,13 +836,17 @@ class MotionTokenizer(nn.Module):
         causal_strength: float = 1.0,
         render_chunk: int = 0,
     ) -> torch.Tensor:
-        """Render exported normalized motion [B,T,D] from a reference image."""
+        """Render normalized reference-relative motion tokens [B,T,D]."""
         if not bool(self.normalizer.ready.item()):
             raise RuntimeError("checkpoint has no finalized corpus normalization statistics")
-        target_motion = self.normalizer.denormalize(normalized_motion)
-        reference_motion = self.encode_motion(reference)
-        delta = self.motion_adapter(
-            target_motion - reference_motion[:, None], causal_strength
-        )
+        motion_delta = self.normalizer.denormalize_delta(normalized_motion)
+        delta = self.motion_adapter(motion_delta, causal_strength)
         features = self.reference_encoder(reference)
-        return self._render_sequence(reference, features, delta, render_chunk)["image"]
+        if self.shared_motion_encoder:
+            _, reference_motion = self._shared_style_and_motion(features)
+        else:
+            reference_motion = self.encode_motion(reference)
+        return self._render_sequence(
+            reference, features, delta, render_chunk,
+            reference_motion=reference_motion,
+        )["image"]

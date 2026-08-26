@@ -386,13 +386,11 @@ def covariance_loss(motion: torch.Tensor) -> torch.Tensor:
 
 
 def motion_moment_loss(motion: torch.Tensor, target_std: float = 0.20) -> torch.Tensor:
-    """Anchor the raw motion coordinate system before corpus normalization.
+    """Anchor raw motion deltas before corpus normalization.
 
-    Reconstruction depends only on differences between motion codes, so their
-    common offset and scale are otherwise weakly identified.  Cross-identity
-    cycle training can exploit that freedom and make the encoder activations
-    grow while the renderer compensates.  Per-dimension centering and scale
-    targets keep the raw coordinates stationary until MotionNormalizer freezes.
+    Renderer weights can compensate for arbitrary delta scale. Per-dimension
+    centering and scale targets keep the representation stationary until the
+    late-window MotionNormalizer freezes.
     """
     if target_std <= 0:
         raise ValueError(f"target_std must be positive, got {target_std}")

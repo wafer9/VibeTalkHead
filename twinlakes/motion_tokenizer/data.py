@@ -146,7 +146,9 @@ class JsonlVideoClipDataset(Dataset):
             reference = random.choice(candidates) if candidates else 0
         return target, reference
 
-    def _decode_clip(self, record: Dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor, str]:
+    def _decode_clip(
+        self, record: Dict[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, str, bool]:
         path = resolve_video_path(record["video_path"], self.video_root)
         reader = VideoReader(path, ctx=cpu(0), num_threads=2)
         fps = float(record.get("fps") or reader.get_avg_fps() or self.target_fps)
@@ -157,14 +159,20 @@ class JsonlVideoClipDataset(Dataset):
         reference, frames = decoded[:1], decoded[1:]
 
         if self.training:
-            # Geometry is shared; color is deliberately independent to discourage
-            # the motion branch from taking a color/illumination shortcut.
+            # Geometry and photometric augmentation are shared across the whole
+            # sample.  Independent reference/target color jitter would force the
+            # only target-side path (motion delta) to carry brightness and color.
             if random.random() < self.horizontal_flip_prob:
                 reference = reference.flip(-1)
                 frames = frames.flip(-1)
-            reference = _photometric(reference, self.photometric_strength)
-            frames = _photometric(frames, self.photometric_strength)
-        return reference[0].mul(2).sub(1), frames.mul(2).sub(1), path
+            augmented = _photometric(
+                torch.cat([reference, frames], dim=0), self.photometric_strength
+            )
+            reference, frames = augmented[:1], augmented[1:]
+        return (
+            reference[0].mul(2).sub(1), frames.mul(2).sub(1), path,
+            reference_index == 0,
+        )
 
     def _decode_single_reference(self, index: int) -> torch.Tensor:
         record = self._record(index)
@@ -185,12 +193,13 @@ class JsonlVideoClipDataset(Dataset):
         for _ in range(self.max_retries):
             try:
                 record = self._record(candidate)
-                reference, frames, path = self._decode_clip(record)
+                reference, frames, path, reference_is_first = self._decode_clip(record)
                 sample: Dict[str, Any] = {
                     "key": record.get("sample_id", str(candidate)),
                     "source": record.get("dataset_source", "unknown"),
                     "video_path": path,
                     "reference": reference,
+                    "reference_is_first": reference_is_first,
                     "frames": frames,
                 }
                 if self.return_cross_reference:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Extract frozen normalized 64-D motion latents from a JSONL manifest."""
+"""Extract normalized first-frame-relative 64-D motion tokens."""
 
 from __future__ import annotations
 
@@ -67,9 +67,12 @@ def encode_video(model, path: str, target_fps: float, batch_frames: int, device)
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             motion = model.encode_motion(frames)
-            motion = model.normalizer.normalize(motion)
         chunks.append(motion.float().cpu())
-    return torch.cat(chunks, dim=0)
+    absolute_motion = torch.cat(chunks, dim=0)
+    # The first decoded frame is the no-motion origin. Delta normalization is
+    # scale-only, so token[0] remains exactly zero.
+    motion_delta = absolute_motion - absolute_motion[:1]
+    return model.normalizer.normalize_delta(motion_delta)
 
 
 def main():
@@ -113,6 +116,9 @@ def main():
                         "fps": args.target_fps,
                         "motion_dim": model.motion_dim,
                         "normalized": True,
+                        "representation": "first_frame_relative_delta",
+                        "normalization": "scale_only_std",
+                        "zero_origin_frame": 0,
                         "source_checkpoint": os.path.abspath(args.checkpoint),
                     }, temporary)
                     os.replace(temporary, output_path)

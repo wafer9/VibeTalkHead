@@ -113,6 +113,17 @@ def barrier() -> None:
         dist.barrier()
 
 
+@torch.no_grad()
+def distributed_mean_scalars(values: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """Average scalar diagnostics over ranks with one small collective."""
+    names = list(values)
+    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        packed.div_(dist.get_world_size())
+    return {name: float(value.item()) for name, value in zip(names, packed)}
+
+
 def seed_everything(seed: int, rank: int) -> torch.Generator:
     seed = seed + rank * 100003
     random.seed(seed)
@@ -130,7 +141,7 @@ def raw_module(module):
 
 
 def model_parameter_groups(model: MotionTokenizer, config: Dict) -> list:
-    motion_ids = {id(parameter) for parameter in model.motion_encoder.parameters()}
+    motion_ids = {id(parameter) for parameter in model.motion_parameters()}
     motion = [parameter for parameter in model.parameters() if id(parameter) in motion_ids]
     main = [parameter for parameter in model.parameters() if id(parameter) not in motion_ids]
     lr = float(config["lr"])
@@ -179,12 +190,17 @@ def autocast_context(device: torch.device, dtype: str):
     return torch.autocast(device_type="cuda", dtype=amp_dtype)
 
 
-def flatten_selected_frames(video: torch.Tensor, maximum: int) -> torch.Tensor:
-    flat = video.flatten(0, 1)
-    if maximum > 0 and flat.shape[0] > maximum:
-        indices = torch.randperm(flat.shape[0], device=flat.device)[:maximum]
-        flat = flat[indices]
-    return flat
+def flatten_selected_frame_pairs(
+    prediction: torch.Tensor, target: torch.Tensor, maximum: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Select identical flattened frame indices for paired GAN features."""
+    prediction = prediction.flatten(0, 1)
+    target = target.flatten(0, 1)
+    if maximum > 0 and prediction.shape[0] > maximum:
+        indices = torch.randperm(prediction.shape[0], device=prediction.device)[:maximum]
+        prediction = prediction[indices]
+        target = target[indices]
+    return prediction, target
 
 
 def compute_generator_losses(
@@ -246,18 +262,19 @@ def compute_generator_losses(
         if float(loss_config.get("flow_tv", 0.0)) != 0 else zero
     )
     losses["covariance"] = (
-        covariance_loss(output["target_motion"])
+        covariance_loss(output["motion_delta"])
         if float(loss_config.get("covariance", 0.0)) != 0 else zero
     )
     if float(loss_config.get("motion_moment", 0.0)) != 0:
-        motion_samples = torch.cat([
-            output["reference_motion"][:, None], output["target_motion"]
-        ], dim=1)
         losses["motion_moment"] = motion_moment_loss(
-            motion_samples, float(loss_config.get("motion_target_std", 0.20))
+            output["motion_delta"], float(loss_config.get("motion_target_std", 0.20))
         )
     else:
         losses["motion_moment"] = zero
+    losses["motion_sparsity"] = (
+        output["target_motion"].abs().mean()
+        if float(loss_config.get("motion_sparsity", 0.0)) != 0 else zero
+    )
     perceptual_weight = float(loss_config.get("perceptual", 0.0))
     if perceptual.enabled and perceptual_weight != 0:
         prediction_frames = reconstruction.flatten(0, 1)
@@ -316,13 +333,19 @@ def compute_generator_losses(
 
     if image_gan_active and image_discriminator is not None:
         maximum = int(loss_config.get("max_gan_frames", 8))
-        fake = flatten_selected_frames(reconstruction, maximum)
-        real = flatten_selected_frames(target, maximum)
-        with torch.no_grad():
-            real_outputs = image_discriminator(real, return_features=True)
-        fake_outputs = image_discriminator(fake, return_features=True)
+        fake, real = flatten_selected_frame_pairs(reconstruction, target, maximum)
+        feature_matching_active = float(loss_config.get("feature_matching", 0.0)) != 0
+        if feature_matching_active:
+            with torch.no_grad():
+                real_outputs = image_discriminator(real, return_features=True)
+            fake_outputs = image_discriminator(fake, return_features=True)
+            losses["feature_matching"] = feature_matching_loss(
+                real_outputs, fake_outputs
+            )
+        else:
+            fake_outputs = image_discriminator(fake, return_features=False)
+            losses["feature_matching"] = reconstruction.new_zeros(())
         losses["image_adversarial"] = generator_hinge(fake_outputs)
-        losses["feature_matching"] = feature_matching_loss(real_outputs, fake_outputs)
     else:
         zero = reconstruction.new_zeros(())
         losses["image_adversarial"] = zero
@@ -359,8 +382,7 @@ def compute_discriminator_losses(
               "video_discriminator": reconstruction.new_zeros(())}
     if image_active and image_discriminator is not None:
         maximum = int(loss_config.get("max_gan_frames", 8))
-        fake = flatten_selected_frames(reconstruction, maximum)
-        real = flatten_selected_frames(target, maximum)
+        fake, real = flatten_selected_frame_pairs(reconstruction, target, maximum)
         result["image_discriminator"] = discriminator_hinge(
             image_discriminator(real), image_discriminator(fake)
         )
@@ -596,7 +618,7 @@ def main() -> None:
 
     training = config["training"]
     if bool(training.get("freeze_motion_encoder", False)):
-        model.motion_encoder.requires_grad_(False)
+        model.set_motion_encoder_requires_grad(False)
     generator_optimizer = torch.optim.AdamW(
         model_parameter_groups(model, training),
         betas=tuple(training.get("betas", [0.9, 0.95])),
@@ -611,6 +633,7 @@ def main() -> None:
         discriminator_parameters,
         lr=float(training.get("discriminator_lr", training["lr"])),
         betas=tuple(training.get("discriminator_betas", [0.0, 0.99])),
+        weight_decay=float(training.get("discriminator_weight_decay", 0.0)),
     ) if discriminator_parameters else None
 
     dtype = training.get("dtype", "bf16")
@@ -696,7 +719,7 @@ def main() -> None:
     accum_steps = int(training.get("accumulation_steps", 1))
     max_steps = int(training["max_steps"])
     normalizer_step = int(config["stages"].get("normalizer_freeze_step", -1))
-    normalizer_start = int(config["stages"].get("normalizer_start_step", 0))
+    normalizer_start = int(config["stages"].get("normalizer_start_step", -1))
     causal_start = int(config["stages"].get("causal_start", -1))
     cross_start = int(config["stages"].get("cross_identity_start", -1))
     image_gan_start = int(config["stages"].get("image_gan_start", -1))
@@ -771,12 +794,17 @@ def main() -> None:
             scaler.scale(generator_loss).backward()
 
             # Corpus stats use only the configured late-training window, so
-            # early encoder drift does not contaminate the exported scale.
-            if step >= normalizer_start:
-                raw.normalizer.update(torch.cat([
-                    output["reference_motion"].detach()[:, None],
-                    output["target_motion"].detach(),
-                ], dim=1))
+            # early encoder drift does not contaminate the exported scale. The
+            # exporter always uses video frame zero as its origin, so random
+            # out-of-clip references must not broaden the token normalizer.
+            if normalizer_start >= 0 and step >= normalizer_start:
+                first_reference = batch["reference_is_first"].to(
+                    device=device, dtype=torch.bool, non_blocking=True
+                )
+                if bool(first_reference.any()):
+                    raw.normalizer.update(
+                        output["motion_delta"].detach()[first_reference]
+                    )
 
             discriminator_losses = {"total": target.new_zeros(())}
             if discriminator_optimizer is not None and (image_gan_active or video_gan_active):
@@ -811,44 +839,109 @@ def main() -> None:
                 discriminator_optimizer.zero_grad(set_to_none=True)
             step += 1
 
-            if rank == 0 and step % log_interval == 0:
-                elapsed = max(time.time() - last_time, 1e-6)
-                last_time = time.time()
-                scalars = {name: float(value.detach().float().item()) for name, value in losses.items()}
-                scalars.update({
-                    f"d_{name}": float(value.detach().float().item())
-                    for name, value in discriminator_losses.items()
+            reduced_scalars = None
+            if step % log_interval == 0:
+                scalar_tensors = dict(losses)
+                scalar_tensors.update({
+                    f"d_{name}": value for name, value in discriminator_losses.items()
                 })
                 with torch.no_grad():
-                    logged_motion = torch.cat([
-                        output["reference_motion"].detach()[:, None],
-                        output["target_motion"].detach(),
-                    ], dim=1).flatten(0, 1).float()
+                    logged_motion = output["motion_delta"].detach().flatten(0, 1).float()
                     motion_mean = logged_motion.mean(dim=0)
                     motion_std = logged_motion.std(dim=0, unbiased=False)
-                    scalars.update({
-                        "motion_raw_mean_rms": float(motion_mean.square().mean().sqrt().item()),
-                        "motion_raw_std_mean": float(motion_std.mean().item()),
-                        "motion_raw_std_max": float(motion_std.max().item()),
+                    active_threshold = 0.25 * float(
+                        loss_config.get("motion_target_std", 0.20)
+                    )
+                    scalar_tensors.update({
+                        "motion_delta_mean_rms": motion_mean.square().mean().sqrt(),
+                        "motion_delta_std_mean": motion_std.mean(),
+                        "motion_delta_std_min": motion_std.min(),
+                        "motion_delta_std_max": motion_std.max(),
+                        "motion_active_fraction": (motion_std > active_threshold).float().mean(),
+                        "flow_abs_mean": output["flow"].detach().float().abs().mean(),
+                        "flow_abs_max": output["flow"].detach().float().abs().max(),
+                        "mask_mean": output["mask"].detach().float().mean(),
+                        "reference_first_fraction": batch["reference_is_first"].to(
+                            device=device, dtype=torch.float32, non_blocking=True
+                        ).mean(),
                     })
-                LOG.info(
-                    "step=%d loss=%.4f rec=%.4f vel=%.4f mvel=%.4f ovel=%.4f "
-                    "mconf=%.3f mvalid=%.2f mgn=%.3e mgclip=%.2f noise=%.3f causal=%.2f "
-                    "mstd=%.3f grad=%.3f lr=%.2e mem=%.2fGB steps/s=%.3f",
-                    step, scalars["total"], scalars["reconstruction"],
-                    scalars["temporal_velocity"], scalars["mouth_landmark_velocity"],
-                    scalars["mouth_openness_velocity"], scalars["mouth_landmark_confidence"],
-                    scalars["mouth_landmark_valid"], scalars["mouth_input_grad_norm"],
-                    scalars["mouth_input_grad_clipped"], noise_strength, causal_strength,
-                    scalars["motion_raw_std_mean"],
-                    float(grad_norm), generator_optimizer.param_groups[0]["lr"],
-                    torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == "cuda" else 0.0,
-                    log_interval / elapsed,
+                reduced_scalars = distributed_mean_scalars(scalar_tensors)
+
+            if rank == 0 and reduced_scalars is not None:
+                elapsed = max(time.time() - last_time, 1e-6)
+                last_time = time.time()
+                scalars = reduced_scalars
+                # Only expose objectives and diagnostics that this run actually
+                # uses.  Older configs intentionally return zero placeholders
+                # for disabled branches, but logging all of them makes the
+                # TensorBoard dashboard look active when no computation occurs.
+                mouth_enabled = (
+                    float(loss_config.get("mouth_landmark_velocity", 0.0)) != 0
+                    or float(loss_config.get("mouth_openness_velocity", 0.0)) != 0
                 )
-                for name, value in scalars.items():
+                always_logged = {
+                    "total", "reconstruction", "motion_delta_mean_rms",
+                    "motion_delta_std_mean", "motion_delta_std_min",
+                    "motion_delta_std_max", "motion_active_fraction",
+                    "flow_abs_mean", "flow_abs_max", "mask_mean",
+                    "reference_first_fraction",
+                }
+                mouth_diagnostics = {
+                    "mouth_landmark_confidence", "mouth_landmark_valid",
+                    "mouth_input_grad_norm", "mouth_input_grad_clipped",
+                }
+
+                def should_log_scalar(name: str) -> bool:
+                    if name in always_logged:
+                        return True
+                    if name in mouth_diagnostics:
+                        return mouth_enabled
+                    if name == "d_total":
+                        return image_gan_start >= 0 or video_gan_start >= 0
+                    if name == "d_image_discriminator":
+                        return image_gan_start >= 0
+                    if name == "d_video_discriminator":
+                        return video_gan_start >= 0
+                    return float(loss_config.get(name, 0.0)) != 0
+
+                visible_scalars = {
+                    name: value for name, value in scalars.items()
+                    if should_log_scalar(name)
+                }
+                log_parts = [
+                    f"step={step}",
+                    f"loss={scalars['total']:.4f}",
+                    f"rec={scalars['reconstruction']:.4f}",
+                ]
+                for name, label in (
+                    ("perceptual", "perc"),
+                    ("flow_tv", "flow_tv"),
+                    ("covariance", "cov"),
+                    ("motion_moment", "moment"),
+                    ("motion_sparsity", "sparse"),
+                    ("image_adversarial", "g_adv"),
+                    ("feature_matching", "fm"),
+                    ("d_image_discriminator", "d_img"),
+                ):
+                    if name in visible_scalars:
+                        log_parts.append(f"{label}={visible_scalars[name]:.4f}")
+                log_parts.extend([
+                    f"dstd={scalars['motion_delta_std_mean']:.3f}",
+                    f"active={scalars['motion_active_fraction']:.2f}",
+                    f"flow_mag={scalars['flow_abs_mean']:.4f}",
+                    f"mask={scalars['mask_mean']:.3f}",
+                    f"grad={float(grad_norm):.3f}",
+                    f"lr={generator_optimizer.param_groups[0]['lr']:.2e}",
+                    f"mem={torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == 'cuda' else 0.0:.2f}GB",
+                    f"steps/s={log_interval / elapsed:.3f}",
+                ])
+                LOG.info(" ".join(log_parts))
+                for name, value in visible_scalars.items():
                     writer.add_scalar(f"train/{name}", value, step)
-                writer.add_scalar("train/causal_strength", causal_strength, step)
-                writer.add_scalar("train/noise_sigma", noise_strength, step)
+                if causal_start >= 0:
+                    writer.add_scalar("train/causal_strength", causal_strength, step)
+                if noise_start >= 0:
+                    writer.add_scalar("train/noise_sigma", noise_strength, step)
                 writer.add_scalar("train/grad_norm", float(grad_norm), step)
                 for group in generator_optimizer.param_groups:
                     writer.add_scalar(f"lr/{group['name']}", group["lr"], step)

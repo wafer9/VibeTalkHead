@@ -28,7 +28,10 @@ def parse_args():
         "--video_root", default="/nfs-speech-cfs/wangzhou/s2s/vibehead/data/talker/shards"
     )
     parser.add_argument("--limit", type=int, default=100)
-    parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument(
+        "--resolution", type=int, default=0,
+        help="output resolution; 0 uses the checkpoint training resolution",
+    )
     parser.add_argument("--fps", type=float, default=25.0)
     parser.add_argument("--encode_batch", type=int, default=64)
     parser.add_argument("--render_chunk", type=int, default=4)
@@ -77,22 +80,36 @@ def reconstruct_to_file(model, video_path: str, output_path: str, args, device):
             reader, indices[start:start + args.encode_batch], model.motion_input_size
         ).to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            motion = model.normalizer.normalize(model.encode_motion(chunk))
+            motion = model.encode_motion(chunk)
         motion_parts.append(motion)
-    normalized = torch.cat(motion_parts, dim=0).unsqueeze(0)
+    absolute_motion = torch.cat(motion_parts, dim=0)
+    motion_delta = absolute_motion - absolute_motion[:1]
+    normalizer_ready = bool(model.normalizer.ready.item())
+    normalized = (
+        model.normalizer.normalize_delta(motion_delta)
+        if normalizer_ready else motion_delta
+    ).unsqueeze(0)
     if args.noise_sigma > 0:
+        if not normalizer_ready:
+            raise RuntimeError(
+                "--noise_sigma requires a finalized motion normalizer"
+            )
         normalized = structured_motion_noise(normalized, args.noise_sigma, args.noise_mode)
 
     # Apply the causal adapter to the full (tiny) latent sequence once, then
     # render/write bounded chunks. This avoids holding a long 512p video in RAM
     # or GPU memory while preserving causal state across chunk boundaries.
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        target_motion = model.normalizer.denormalize(normalized)
-        reference_motion = model.encode_motion(reference)
-        delta = model.motion_adapter(
-            target_motion - reference_motion[:, None], args.causal_strength
+        motion_delta = (
+            model.normalizer.denormalize_delta(normalized)
+            if normalizer_ready else normalized
         )
+        delta = model.motion_adapter(motion_delta, args.causal_strength)
         reference_features = model.reference_encoder(reference)
+        if model.shared_motion_encoder:
+            _, reference_motion = model._shared_style_and_motion(reference_features)
+        else:
+            reference_motion = model.encode_motion(reference)
 
     writer = cv2.VideoWriter(
         output_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
@@ -105,7 +122,8 @@ def reconstruct_to_file(model, video_path: str, output_path: str, args, device):
             stop = min(delta.shape[1], start + args.render_chunk)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 prediction = model._render_sequence(
-                    reference, reference_features, delta[:, start:stop], args.render_chunk
+                    reference, reference_features, delta[:, start:stop], args.render_chunk,
+                    reference_motion=reference_motion,
                 )["image"][0]
             rgb = prediction.float().cpu().add(1).mul(127.5).clamp(0, 255)
             rgb = rgb.byte().permute(0, 2, 3, 1).numpy()
@@ -159,7 +177,16 @@ def main():
     model = MotionTokenizer(**checkpoint["config"]["model"])
     model.load_state_dict(checkpoint["model"], strict=True)
     if not bool(model.normalizer.ready.item()):
-        raise RuntimeError("checkpoint normalizer is not finalized")
+        print(
+            "checkpoint has no finalized normalizer; clean GT-motion reconstruction "
+            "will use raw reference-relative delta"
+        )
+    if args.resolution <= 0:
+        args.resolution = int(
+            checkpoint["config"].get("data", {}).get(
+                "image_size", model.motion_input_size
+            )
+        )
     model = model.to(device).eval()
     os.makedirs(args.output_dir, exist_ok=True)
     with open(args.manifest) as stream:

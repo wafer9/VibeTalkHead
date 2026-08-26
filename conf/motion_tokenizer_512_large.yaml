@@ -5,7 +5,7 @@
 # renderer.  At 90k the corpus normalizer is finalized and the motion encoder
 # is frozen for a short 10k renderer calibration phase.
 seed: 2026
-output_dir: exp/motion_tokenizer_512_large
+output_dir: exp/motion_tokenizer_512_large_delta
 resume: null
 
 data:
@@ -15,7 +15,7 @@ data:
   target_fps: 25
   image_size: 512
   clip_length: 4
-  batch_size: 1
+  batch_size: 8
   val_batch_size: 1
   num_workers: 4
   prefetch_factor: 2
@@ -28,7 +28,8 @@ data:
   horizontal_flip_prob: 0.5
 
 model:
-  # Keep the exported LLM/DiT target compact; scale spatial capacity instead.
+  # Keep the exported LLM/DiT target compact; normalize it as a
+  # reference-relative delta while scaling spatial capacity separately.
   motion_dim: 64
   base_channels: 80
   motion_blocks_per_stage: 3
@@ -48,11 +49,12 @@ training:
   lr: 0.0001
   motion_lr_multiplier: 1.0
   discriminator_lr: 0.0001
+  discriminator_weight_decay: 0.0
   betas: [0.9, 0.95]
   discriminator_betas: [0.0, 0.99]
   weight_decay: 0.01
   # 16 GPUs gives an effective 128 clips / 512 target frames per update.
-  accumulation_steps: 8
+  accumulation_steps: 1
   grad_clip: 1.0
   discriminator_grad_clip: 5.0
   dtype: bf16
@@ -68,13 +70,9 @@ training:
   save_interval: 5000
 
 stages:
-  # Clean frame reconstruction first.  The image GAN is the only staged
-  # generation branch; temporal/noise/cross-ID tricks stay out of this run.
-  cross_identity_start: -1
+  # Clean frame reconstruction first, then enable the image GAN.  Omitted
+  # stages default to disabled.
   image_gan_start: 10000
-  video_gan_start: -1
-  causal_start: -1
-  noise_start: -1
 
   # Collect statistics only from the late, nearly converged encoder, then
   # freeze it for the final renderer calibration window.
@@ -88,35 +86,16 @@ loss:
   image_adversarial: 0.10
   feature_matching: 0.50
 
-  # Small representation/flow regularizers only; all targeted tricks are off.
+  # Small representation/flow regularizers only.  Omitted losses default to
+  # zero, so disabled experimental objectives do not clutter the run config.
   flow_tv: 0.001
   covariance: 0.001
   motion_moment: 0.01
   motion_target_std: 0.20
 
-  laplacian: 0.0
-  gradient: 0.0
-  region: 0.0
-  temporal_velocity: 0.0
-  temporal_acceleration: 0.0
-  mouth_landmark_velocity: 0.0
-  mouth_openness_velocity: 0.0
-  identity: 0.0
-  noisy_reconstruction: 0.0
-  noise_consistency: 0.0
-  noisy_temporal: 0.0
-  cross_motion_cycle: 0.0
-  cross_appearance: 0.0
-  cross_identity: 0.0
-  video_adversarial: 0.0
-
-  laplacian_levels: 4
   max_perceptual_frames: 2
   max_gan_frames: 2
   vgg_weights_path: checkpoints/motion_tokenizer/vgg16-397923af.pth
-  identity_model_path: null
-  fan_weights_path: null
-  face_alignment_path: null
 
 image_discriminator:
   # Native 512 / 256 / 128 PatchGAN views, about 20.9M parameters total.
@@ -124,7 +103,3 @@ image_discriminator:
   base_channels: 64
   max_channels: 512
   num_layers: 5
-
-video_discriminator:
-  base_channels: 32
-  max_channels: 256

@@ -584,7 +584,8 @@ CUDA_VISIBLE_DEVICES=0 python -m twinlakes.bin.reconstruct_motion_tokenizer \
 虽然重建误差略降，但 motion encoder/normalizer 完全没有更新，44k 之后 Sync 也不再提升。新的主线改为
 直接从零训练原生 512、约 200M 参数的 clean warp-render autoencoder。
 
-配置：`conf/motion_tokenizer_512_large.yaml`
+配置：`conf/motion_tokenizer_512_large.yaml`，新的 delta-token 实验输出到
+`exp/motion_tokenizer_512_large_delta`，避免与此前 absolute-token 试跑的 TensorBoard 混合。
 
 - generator：198.86M，其中 motion encoder 49.90M、reference encoder 66.51M、renderer 82.41M；
 - motion latent 仍为 64D，容量增加集中在空间 encoder/renderer；
@@ -593,6 +594,51 @@ CUDA_VISIBLE_DEVICES=0 python -m twinlakes.bin.reconstruct_motion_tokenizer \
 - 0--90k 全部端到端训练，90k 固定 late-window normalizer 和 motion encoder，最后 10k 校准 renderer；
 - 主目标只保留 reconstruction、VGG、image GAN、feature matching，以及很小的 flow/latent 正则；
 - causal、structured noise、cross-ID、video GAN、landmark/velocity loss 在 clean 主训练中全部关闭。
+
+### 512 Large 的 motion token 定义
+
+绝对 encoder 输出 `E(x_t)` 不再直接作为 LLM/DiT 目标。训练 renderer 时使用
+
+```text
+d_t = E(x_t) - E(x_ref)
+```
+
+作为唯一进入 renderer 的 motion；normalizer 也只统计 `d_t`。批量导出完整视频时固定第一帧为参考，输出
+
+```text
+token_t = (E(x_t) - E(x_0)) / std_delta
+```
+
+其中采用只缩放、不减均值的 delta normalization，保证 `token_0` 严格为全零。导出的 `.pt` 额外写入
+`representation=first_frame_relative_delta`，防止后续数据管线把它和旧的 absolute motion 混用。
+推理 renderer 直接将 token 乘回 `std_delta` 后使用，不再先恢复 absolute motion 再减 reference code。
+训练 renderer 时仍保留随机远端 reference，但 70k--90k 的 normalizer 只统计 reference 为视频首帧的样本，
+保证训练统计的 delta 原点与正式导出一致。
+
+为避免后续混淆，固定 LIA-X 术语如下。encoder 输出的 `A_{r->t}` 是从共享隐式 reference `r` 到帧 `t`
+的 motion-dictionary 系数；它是 canonical coefficient，并不是已经减去 source/首帧的 delta。做 cross-
+reenactment 时实际施加的是 `Delta A_t = A_{r->t} - A_{r->1}`，再加到 source baseline `A_{r->s}` 上，
+即最终系数为 `A_{r->s} + Delta A_t`。因此，“LIA-X 的动画传递使用相对运动差”是对的，但不能把原始
+`A_{r->t}` 和 `Delta A_t` 当成同一个张量。当前旧 s5 数据管线保存和预测的是逐帧 raw `A_{r->t}`，没有
+在数据侧执行 `A_{r->t} - A_{r->1}`；self-reenactment 时 source 与 driving 首帧一致，公式中的差值会抵消，
+所以可以直接使用 `A_{r->t}`。
+
+cross-ID 暂时不进入本轮 clean reconstruction baseline，但这**不是**因为 delta 可以替代或降低 cross-ID
+解耦要求。`E(x_t)-E(x_ref)` 只有在 encoder 的 identity 成分近似为可加、且同一身份不同帧共享同一
+offset 时才会抵消 identity；对一般非线性、identity-dependent motion coordinates 并无保证。LIA-X 的关键
+是先学习共享 canonical `A` 坐标和 motion dictionary，再在动画应用层计算 `Delta A`；其解耦不能简单归因于
+first-frame subtraction。正式接受 motion token 前，必须执行 identity probe 和 cross-reference oracle；若
+identity leakage 明显，就需要加入 cross-ID/cycle/invariance 约束，不能继续把 delta 当作替代方案。
+
+reference/target 的几何和 photometric augmentation 必须整段共享。若两边独立做 brightness、contrast、
+saturation jitter，而训练目标又要求逐像素匹配 target，网络只能把这组人为制造的颜色差塞进 motion delta，
+会直接破坏 token 语义。
+
+另外，image GAN 的 fake/real 抽帧必须共享相同索引。尤其 feature matching 是成对特征距离，如果分别随机
+抽帧，会把不同人物或不同时刻当作配对监督；512 Large 代码已改为 paired frame sampling。
+训练日志每 20 step 对各 rank 当前 scalar 做一次全局均值，避免只看 rank 0 的最后一个 batch；同时记录
+`motion_delta_std_{min,mean,max}`、active dimension 比例、flow magnitude 和 mask mean，用于区分 latent
+塌缩、只复制 reference 和正常的 warp-render 学习。
 
 两机 16 卡沿用统一入口：
 
@@ -610,6 +656,87 @@ bash run.sh 2 1
 bash run_motion_tokenizer.sh
 ```
 
-默认每卡 `batch_size=1`、`clip_length=4`、累积 8 次；16 卡时每次 optimizer update 等效处理
-128 个 clip / 512 个 target frame。activation checkpointing 已启用，单卡真实数据 clean backward 的实测
-峰值显存约 5.83 GB；开启三尺度 GAN 的独立 G/D backward 也已通过。
+默认每卡 `batch_size=8`、`clip_length=4`、不做梯度累积；16 卡时每次 optimizer update 等效处理
+128 个 clip / 512 个 target frame。activation checkpointing 已启用，16 卡 clean 训练实测单卡峰值约
+36.96 GB、约 0.339 optimizer step/s。10k 开启 GAN 后需要重新观察峰值显存和吞吐。
+
+### TODO：将 motion delta 做成 Gaussian-friendly latent
+
+当前主训练先保持 deterministic、reference-relative delta，优先验证 512 Large 的重建上限、嘴型/眨眼
+信息量和 identity leakage。后续在 clean autoencoder 收敛、normalizer 固定以后，引入类似 VibeVoice
+acoustic tokenizer 的 stochastic latent 训练，使 renderer 能在带预测误差的连续 latent 上保持细节和稳定性。
+
+这里必须明确：做 Gaussian-friendly latent 的主要目的**不是解决 delta 积分误差**。本方案使用的是相对固定
+第一帧的 `d_t = E(x_t) - E(x_0)`，不是相邻帧 velocity `E(x_t) - E(x_{t-1})`；每一帧都独立相对
+同一个 reference 定义，推理时不需要逐帧积分，因此不会产生传统 delta random walk。Gaussian-friendly
+主要解决的是 absolute/relative latent 的各维尺度不均、协方差病态、分布空洞、预测值落入训练分布之外，
+以及 renderer 对轻微 latent 预测误差过度敏感的问题。高斯化本身不自动产生容错性，必须配合与真实
+LLM/DiT residual 的幅度和时间相关性匹配的 noisy-latent reconstruction，显式训练 decoder 的局部平滑性。
+
+后续 LLM/DiT 是否预测 reference-relative delta 不能仅凭结构直觉预先定论。delta 的确定优势只有严格零起点、
+不重复预测 reference baseline，以及相对固定第一帧时没有相邻帧 delta 的积分漂移；它**不天然实现身份解耦**，
+也不天然比 absolute code 更高斯或更容易由音频预测。相反，delta 还会让同一嘴型/姿态的数值依赖 reference
+初始状态。必须保留同架构下的 absolute-vs-delta ablation，比较 clean/noise oracle、identity probe、
+cross-reference 和真实 LLM/DiT 预测误差后再选表示。若两者各有优势，可采用“reference absolute anchor +
+relative motion residual”的混合表示，而不是把 delta 当作免除 cross-ID 训练的理由。
+
+计划如下：
+
+1. 保留 `d_t = E(x_t) - E(x_0)`；首帧 `d_0=0` 是特殊原点，禁止加噪，也不参加 Gaussian prior loss。
+2. 在 held-out 数据上统计每维 mean/std、covariance eigenvalue、effective rank、skewness、kurtosis 和尾部分位数；
+   逐维 scale normalization 只保证二阶尺度一致，不能被误称为严格正态分布。
+3. normalizer 固定后，在 normalized delta 上加入固定小方差 Gaussian noise，联合优化 clean/noisy reconstruction；
+   从小 `sigma` 开始，根据嘴型、眨眼 oracle 和真实 DiT residual 决定最终噪声强度，不能直接照搬
+   VibeVoice 的 `fix_std=0.5`。
+4. 若分布明显重尾或多维相关影响 DiT，再比较弱 KL、MMD/Sliced-Wasserstein 和可逆 whitening/flow；
+   优先约束 aggregated posterior，避免强 per-sample KL 压低 motion mutual information。
+5. LLM/DiT 阶段同时比较 GT/predicted token 的 per-dim variance ratio、低频 drift、velocity、acceleration、
+   高频能量和跨 token boundary continuity。Gaussian-friendly 只解决优化与抗噪，不能替代时序分布匹配。
+
+验收标准不是“直方图看起来像高斯”，而是：token 数据集尺度均衡、无塌缩、renderer 在合理 latent noise
+下不丢嘴唇/眼睛细节，并且 LLM/DiT 预测分布与 GT 的幅度和时间频谱一致。
+
+---
+
+## 当前重训版本：256 LIA-X-style feature-warp autoencoder
+
+512 Large 的独立 motion/reference encoder 和最终 warped-RGB blend 容易形成“motion 通路弱、reference
+复制通路强”的捷径。当前重训版改回更接近 LIA-X 的主干，配置为
+`conf/motion_tokenizer_256_liax.yaml`，输出目录为 `exp/motion_tokenizer_256_liax_fused`：
+
+- source/target 使用同一个多尺度 encoder；
+- encoder 先产生 512D shared style，再预测 64D canonical motion coefficient `A_t`；
+- 64D coefficient 经正交 motion dictionary 映射回 renderer style；
+- renderer 内部使用 absolute target coefficient `A_t`，而导给 LLM/DiT 的 token 仍是
+  `A_t - A_0` 的 scale-only normalized delta；
+- 每一层先用 FiLM residual blocks 充分注入 target motion，再从同一个 motion-refined feature 预测
+  flow 和 feature mask；删除 warp 后的 concat/pre convolution，避免 flow/mask 在运动调制不足时提前决定；
+- 执行 `warped_feature = mask * grid_sample(source_feature, flow)`、
+  `generated_feature = (1 - mask) * h` 和
+  `fused_feature = warped_feature + generated_feature`；下一层 renderer 和当前尺度 ToRGB 都接收
+  `fused_feature`，使遮挡、口腔内部和眼睑等不能由 reference warp 得到的内容有直接生成通路；
+- feature mask 保留，因为它属于 LIA-X 的 ToFlow 特征融合；删除的是最终输出端
+  `mask * warped_reference_rgb + (1 - mask) * render_rgb` 这条 raw-RGB shortcut；
+- 最终图像只由各尺度 fused feature 的 residual blocks 和 ToRGB skip 累加生成；
+- 删除各尺度 warp 后 concat/pre convolution 后，generator 为 200.880M 参数，正好处于目标的约 200M 规模；
+- loss 保持简单：L1 reconstruction + VGG perceptual + image GAN + 很小的 absolute coefficient L1 sparsity；
+  causal、noise、cross-ID、landmark、velocity 和 video GAN 暂不加入首轮 baseline。
+
+训练按每卡 batch=8、16 卡 global batch=128 设置为 50k step：0--5k 只训练 L1/VGG/sparsity，5k
+启动 image GAN，之后一直端到端训练到 50k。本轮不收集或固定 motion normalizer，也不冻结 shared
+encoder/motion head；它只验证重建上限，不产出供 LLM/DiT 正式训练的最终 token 分布。后续用 KL 或其他
+Gaussian-friendly 约束重新定义 latent 分布。未配置的 causal、noise、cross-ID 和 video GAN stage 均关闭。
+
+本机真实数据单步 smoke test 已通过：batch=8、clip=4、render chunk=1 时峰值显存 22.64GB；双卡 DDP
+也已通过。forward/backward 中除显式关闭的 causal adapter 外，shared encoder、motion head、orthogonal
+dictionary、FiLM、flow、feature mask、generated branch 和 ToRGB 都有非零梯度。正式训练脚本默认已经
+切到此配置：
+
+```bash
+# 两机 16 卡
+bash run.sh 2 0
+bash run.sh 2 1
+
+# 单机 8 卡
+bash run_motion_tokenizer.sh
+```

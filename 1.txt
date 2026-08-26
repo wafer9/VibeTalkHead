@@ -1,0 +1,116 @@
+你的代码整体结构不错(注释也说明了设计意图),但确实存在导致"眼/嘴冻结在 reference"的几个问题。我按严重程度列出。
+
+🔴 问题 1(核心):RGB 通路只吃 warped_feature,render 通路被架空
+看 SourceAnchoredRenderer.forward 里最终生成 RGB 的部分:
+
+python
+for rgb_stage, warped_feature in zip(self.rgb_stages, warped_features):
+    rgb_feature, rgb = rgb_stage(warped_feature, rgb_feature, rgb)
+image = torch.tanh(rgb)
+而 warped_feature 是在 FlowRenderStage 里算的:
+
+python
+warped_feature = warped_ref * mask       # ← 纯粹是 warp 后的 ref 特征 × mask
+h = warped_feature + (1.0 - mask) * h    # ← 这个融合后的 h 才含 render 内容
+return h, flow, warped_feature, mask     # ← 但传给 RGB 通路的是 warped_feature,不是 h!
+致命点:
+
+h(含 render 生成内容 = (1-mask)*h)被用作下一 stage 的输入,但没有进入最终 RGB 输出
+最终 RGB 完全由 warped_feature = warped_ref * mask 决定
+warped_ref 是 warp 后的源图特征,本质是"搬移源图内容"
+眼/嘴需要生成的新内容(牙齿、闭眼)全在 (1-mask)*h 里,而这部分根本没进 RGB!
+所以你虽然注释写着"no raw-RGB blending shortcut",但实际上你的 RGB 通路走的是一条更隐蔽的 warp 捷径——它只用 warped source feature 生成图,render 生成的内容被丢弃了。这就是眼/嘴冻结的直接原因。
+
+修复
+RGB 通路应该吃融合后的 h(或至少包含 render 内容的特征),而不是 warped_feature:
+
+python
+# FlowRenderStage.forward 里额外返回融合后的特征
+fused = warped_feature + (1.0 - mask) * h
+return h, flow, fused, mask   # 用 fused 替代 warped_feature 喂 RGB 通路
+或者在 renderer 里:
+
+python
+for rgb_stage, fused_feature in zip(self.rgb_stages, fused_features):  # 用 fused 而非 warped
+    rgb_feature, rgb = rgb_stage(fused_feature, rgb_feature, rgb)
+这是最关键的一处修改。
+
+🔴 问题 2:mask 融合方向可能反了,且 mask 天然偏向 warp
+python
+mask = torch.sigmoid(self.mask_head(h))
+warped_feature = warped_ref * mask
+h = warped_feature + (1.0 - mask) * h
+语义是:mask → 1 用 warp,mask → 0 用 render。但:
+
+sigmoid 初始输出 ≈ 0.5,而且没有任何机制鼓励 mask 在眼嘴区域趋向 0
+由于 warp 捷径(问题 1)让"照抄源图"损失更低,mask 会被优化到普遍偏大(偏向 warp),render 更被抑制
+眼/嘴恰恰是最需要 mask→0(用 render)的区域,却因为整体偏向 warp 而拿不到 render
+建议
+修好问题 1 后,mask 的压力会缓解
+可以对 mask 加轻微正则,或初始化 mask_head 偏置为负(让初始 mask 偏小,鼓励 render 先学起来)
+或者干脆去掉 feature 层的 mask 硬融合,让 render 网络自己学融合
+
+
+
+
+新的问题：
+
+虽然 RGB 走 warped feature,但官方有几个你缺失/削弱的设计,让 warp 通路本身足够强、且 RGB 通路能逐级累积精修。
+
+🔴 差异 1:官方 RGB 通路有跨尺度 warped feature 累加,你的没有
+官方每一级 RGB 都把上一级的 warped feature 上采样加进来:
+
+python
+h_warp2, h, h_flow2 = self.flow2(h, z_s2t, feats[1], h_flow_512)
+h_warp2 = h_warp2 + self.conv2_2_up(h_warp_512)   # ← 累加上一级 warped feature
+for conv in self.conv2_2_rgb:
+    h_warp2 = conv(h_warp2)
+rgb2 = self.rgb2(h_warp2, rgb_512)                # ← RGB 也累加上一级 RGB
+你的 FeatureRGBStage 虽然也有 previous 累加,但你累加的是 warped_feature(只含 warp),而官方累加链里 warp 特征经过了 4 个 FlowResBlock(styled conv,motion 调制)的精修。
+
+🔴 差异 2(最关键):官方 warp 前的 h 由大量 motion 调制的 StyledConv/FlowResBlock生成,warp 通路的"内容"其实很丰富
+看官方每个 block:
+
+python
+h = self.conv2_1(h, z_s2t)              # StyledConv,motion 调制
+for conv in self.conv2_2:               # 4 个 FlowResBlock,全部 motion 调制
+    h = conv(h, z_s2t)
+h_warp2, h, h_flow2 = self.flow2(h, z_s2t, feats[1], h_flow_512)
+关键点:feats[1] 是 warp 的对象(源图特征),但 flow 是由 motion 调制的 h 生成的。而且 feat_warp = grid_sample(feat, flow) —— warp 的是 source encoder 的多尺度特征,这些特征包含了源图的完整外观(包括眼睛、嘴的区域)。
+
+你的实现里,warp 对象 ref 来自 ReferenceEncoder,但你的 ReferenceEncoder blocks_per_stage 默认只有 1,而且是普通 ResidualBlock(无 motion 调制)。相比官方每级 4 个 motion 调制的 FlowResBlock,你的 warp 通路特征表达力弱太多。
+
+🔴 差异 3:官方 flow 无 max_flow 限制,你的 flow 被 tanh × max_flow 严重限幅
+官方:
+
+python
+sampler = torch.tanh(out[:, 0:2, :, :])       # tanh 后直接作为归一化坐标偏移
+flow = sampler.permute(...) + xs
+tanh 范围 [-1,1],叠加到 [-1,1] 的网格上 —— 光流可以覆盖整个图像范围,位移幅度非常大。
+
+你的:
+
+python
+residual_flow = torch.tanh(self.flow_head(h)) * self.max_flow   # max_flow 只有 0.05~0.2!
+flow = flow + residual_flow
+你把光流限制在极小范围(高分辨率层只有 0.05,即 ±5% 图像宽度)。
+
+这就是眼嘴冻结的重要原因之一! 眨眼、张嘴需要的局部像素位移可能超过 5%,而你的 flow 根本挪不了那么大 → warp 挪不到位 → 眼嘴保持源图状态。官方不限幅,所以 warp 能大幅移动像素实现眼嘴运动。
+
+
+
+=========修改============
+
+修改一：
+ 把当前尺度的 FiLMResidualBlock 移到 flow/mask 预测之前，
+ 让 flow 和 mask 都由充分 motion-modulated 的 h 产生。
+
+修改二：
+让 ToRGB 接收融合特征：
+
+  warped_feature = mask × warped_ref
+  generated_feature = (1 - mask) × h
+  fused_feature = warped_feature + generated_feature
+
+  下一层使用 fused_feature
+  ToRGB 也使用 fused_feature
