@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Render the GT-motion upper bound (and normalized-noise stress tests)."""
+"""Render the GT-alpha reconstruction upper bound of the LIA-X model."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from decord import VideoReader, cpu
 from tqdm import tqdm
 
 from twinlakes.motion_tokenizer.data import resolve_video_path
-from twinlakes.motion_tokenizer.model import MotionTokenizer, structured_motion_noise
+from twinlakes.motion_tokenizer.model import MotionTokenizer
 
 
 def parse_args():
@@ -35,9 +35,6 @@ def parse_args():
     parser.add_argument("--fps", type=float, default=25.0)
     parser.add_argument("--encode_batch", type=int, default=64)
     parser.add_argument("--render_chunk", type=int, default=4)
-    parser.add_argument("--noise_sigma", type=float, default=0.0)
-    parser.add_argument("--noise_mode", choices=["iid", "bias", "drift", "mixed"], default="iid")
-    parser.add_argument("--causal_strength", type=float, default=1.0)
     parser.add_argument(
         "--mux_audio", action="store_true",
         help="mux each manifest wav_path/audio into the reconstructed mp4",
@@ -77,39 +74,12 @@ def reconstruct_to_file(model, video_path: str, output_path: str, args, device):
     motion_parts = []
     for start in range(0, len(indices), args.encode_batch):
         chunk = decode_frames(
-            reader, indices[start:start + args.encode_batch], model.motion_input_size
+            reader, indices[start:start + args.encode_batch], args.resolution
         ).to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             motion = model.encode_motion(chunk)
-        motion_parts.append(motion)
+        motion_parts.append(motion.float().cpu())
     absolute_motion = torch.cat(motion_parts, dim=0)
-    motion_delta = absolute_motion - absolute_motion[:1]
-    normalizer_ready = bool(model.normalizer.ready.item())
-    normalized = (
-        model.normalizer.normalize_delta(motion_delta)
-        if normalizer_ready else motion_delta
-    ).unsqueeze(0)
-    if args.noise_sigma > 0:
-        if not normalizer_ready:
-            raise RuntimeError(
-                "--noise_sigma requires a finalized motion normalizer"
-            )
-        normalized = structured_motion_noise(normalized, args.noise_sigma, args.noise_mode)
-
-    # Apply the causal adapter to the full (tiny) latent sequence once, then
-    # render/write bounded chunks. This avoids holding a long 512p video in RAM
-    # or GPU memory while preserving causal state across chunk boundaries.
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        motion_delta = (
-            model.normalizer.denormalize_delta(normalized)
-            if normalizer_ready else normalized
-        )
-        delta = model.motion_adapter(motion_delta, args.causal_strength)
-        reference_features = model.reference_encoder(reference)
-        if model.shared_motion_encoder:
-            _, reference_motion = model._shared_style_and_motion(reference_features)
-        else:
-            reference_motion = model.encode_motion(reference)
 
     writer = cv2.VideoWriter(
         output_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
@@ -118,13 +88,13 @@ def reconstruct_to_file(model, video_path: str, output_path: str, args, device):
     if not writer.isOpened():
         raise RuntimeError(f"cannot create {output_path}")
     try:
-        for start in range(0, delta.shape[1], args.render_chunk):
-            stop = min(delta.shape[1], start + args.render_chunk)
+        for start in range(0, absolute_motion.shape[0], args.render_chunk):
+            stop = min(absolute_motion.shape[0], start + args.render_chunk)
+            alpha = absolute_motion[start:stop].to(device).unsqueeze(0)
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                prediction = model._render_sequence(
-                    reference, reference_features, delta[:, start:stop], args.render_chunk,
-                    reference_motion=reference_motion,
-                )["image"][0]
+                prediction = model.render_motion(
+                    reference, alpha, render_chunk=args.render_chunk
+                )[0]
             rgb = prediction.float().cpu().add(1).mul(127.5).clamp(0, 255)
             rgb = rgb.byte().permute(0, 2, 3, 1).numpy()
             for frame in rgb:
@@ -176,17 +146,10 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = MotionTokenizer(**checkpoint["config"]["model"])
     model.load_state_dict(checkpoint["model"], strict=True)
-    if not bool(model.normalizer.ready.item()):
-        print(
-            "checkpoint has no finalized normalizer; clean GT-motion reconstruction "
-            "will use raw reference-relative delta"
-        )
     if args.resolution <= 0:
-        args.resolution = int(
-            checkpoint["config"].get("data", {}).get(
-                "image_size", model.motion_input_size
-            )
-        )
+        args.resolution = int(checkpoint["config"]["data"]["image_size"])
+    if args.resolution != 512:
+        raise ValueError("official LIA-X Encoder/Decoder is fixed to 512x512")
     model = model.to(device).eval()
     os.makedirs(args.output_dir, exist_ok=True)
     with open(args.manifest) as stream:

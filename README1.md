@@ -698,39 +698,33 @@ relative motion residual”的混合表示，而不是把 delta 当作免除 cro
 
 ---
 
-## 当前重训版本：256 LIA-X-style feature-warp autoencoder
+## 当前重训版本：官方 LIA-X Encoder + Decoder
 
-512 Large 的独立 motion/reference encoder 和最终 warped-RGB blend 容易形成“motion 通路弱、reference
-复制通路强”的捷径。当前重训版改回更接近 LIA-X 的主干，配置为
-`conf/motion_tokenizer_256_liax.yaml`，输出目录为 `exp/motion_tokenizer_256_liax_fused`：
+此前自定义 256 renderer 在 full-resolution stage 形成了 reference-copy shortcut，最终 mask 持续升到
+0.95 以上。该分支已经停止，代码保存在 commit `6de6356`。当前版本不再修改 renderer 细节，直接 vendoring
+`/nfs-speech-cfs/wangzhou/s2s/Talker-T2AV/lia_x/networks/encoder.py` 和 `decoder.py`：
 
-- source/target 使用同一个多尺度 encoder；
-- encoder 先产生 512D shared style，再预测 64D canonical motion coefficient `A_t`；
-- 64D coefficient 经正交 motion dictionary 映射回 renderer style；
-- renderer 内部使用 absolute target coefficient `A_t`，而导给 LLM/DiT 的 token 仍是
-  `A_t - A_0` 的 scale-only normalized delta；
-- 每一层先用 FiLM residual blocks 充分注入 target motion，再从同一个 motion-refined feature 预测
-  flow 和 feature mask；删除 warp 后的 concat/pre convolution，避免 flow/mask 在运动调制不足时提前决定；
-- 执行 `warped_feature = mask * grid_sample(source_feature, flow)`、
-  `generated_feature = (1 - mask) * h` 和
-  `fused_feature = warped_feature + generated_feature`；下一层 renderer 和当前尺度 ToRGB 都接收
-  `fused_feature`，使遮挡、口腔内部和眼睑等不能由 reference warp 得到的内容有直接生成通路；
-- feature mask 保留，因为它属于 LIA-X 的 ToFlow 特征融合；删除的是最终输出端
-  `mask * warped_reference_rgb + (1 - mask) * render_rgb` 这条 raw-RGB shortcut；
-- 最终图像只由各尺度 fused feature 的 residual blocks 和 ToRGB skip 累加生成；
-- 删除各尺度 warp 后 concat/pre convolution 后，generator 为 200.880M 参数，正好处于目标的约 200M 规模；
-- loss 保持简单：L1 reconstruction + VGG perceptual + image GAN + 很小的 absolute coefficient L1 sparsity；
-  causal、noise、cross-ID、landmark、velocity 和 video GAN 暂不加入首轮 baseline。
+- `encoder.py`、`decoder.py` 与给定 LIA-X 源文件逐行一致，保留原版权声明；
+- 使用官方 Encoder2R、R2T alpha、Direction 正交字典、七级 StyledConv/ToFlow/ToRGB decoder；
+- 官方结构固定输入输出为 512x512，不能在不删层的情况下改成 256；
+- generator 为 227.753M 参数，其中 encoder 28.973M、decoder 198.780M；
+- motion latent 是官方 64D absolute alpha，训练 renderer 时不做 delta、normalizer、KL 或 causal 处理；
+- loss 只保留 L1 reconstruction、VGG perceptual 和 multi-scale image GAN；
+- trainer 已删除 cross-ID、cycle、noise、causal、mouth/landmark、velocity loss、flow/mask regularizer、
+  video GAN、feature matching 和 normalizer stage；TensorBoard 也不再记录这些字段；
+- StyleGAN2 fused CUDA op 使用数学等价的纯 PyTorch fallback，避免多机首次运行时现场编译扩展。
 
-训练按每卡 batch=8、16 卡 global batch=128 设置为 50k step：0--5k 只训练 L1/VGG/sparsity，5k
-启动 image GAN，之后一直端到端训练到 50k。本轮不收集或固定 motion normalizer，也不冻结 shared
-encoder/motion head；它只验证重建上限，不产出供 LLM/DiT 正式训练的最终 token 分布。后续用 KL 或其他
-Gaussian-friendly 约束重新定义 latent 分布。未配置的 causal、noise、cross-ID 和 video GAN stage 均关闭。
+配置为 `conf/motion_tokenizer_liax_official.yaml`，输出目录为
+`exp/motion_tokenizer_liax_official`。每卡 batch=2、clip=4、累积4次；16卡每个 optimizer update 仍处理
+128个 clip。实测每卡峰值显存约57.13GB。227.753M 全参数都有非零梯度，单卡、双卡 DDP/no_sync 和
+双卡 L1+VGG+GAN 前后向均已通过。5k step 启动 image GAN，训练到50k。
 
-本机真实数据单步 smoke test 已通过：batch=8、clip=4、render chunk=1 时峰值显存 22.64GB；双卡 DDP
-也已通过。forward/backward 中除显式关闭的 causal adapter 外，shared encoder、motion head、orthogonal
-dictionary、FiLM、flow、feature mask、generated branch 和 ToRGB 都有非零梯度。正式训练脚本默认已经
-切到此配置：
+注意：官方 Decoder 没有输出 mask/flow diagnostics，因此新日志中不再出现 mask；这不是隐藏问题，而是训练
+wrapper 不再侵入官方计算图。导出脚本当前保存官方 absolute alpha，标记为 `liax_absolute_alpha`。是否转换成
+first-frame-relative delta、如何归一化和 Gaussian-friendly 训练，等 clean reconstruction 收敛后再做独立
+ablation，不混入本轮 baseline。
+
+正式训练入口：
 
 ```bash
 # 两机 16 卡

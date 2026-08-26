@@ -1,0 +1,68 @@
+# Official LIA-X Encoder + Decoder reconstruction training at 512x512.
+seed: 2026
+output_dir: exp/motion_tokenizer_liax_official
+resume: null
+
+data:
+  train_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/train.json
+  val_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/dev.json
+  video_root: /nfs-speech-cfs/wangzhou/s2s/vibehead/data/talker/shards
+  target_fps: 25
+  image_size: 512
+  clip_length: 4
+  batch_size: 2
+  val_batch_size: 1
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  max_retries: 12
+  max_train_samples: 0
+  max_val_samples: 0
+  first_frame_reference_prob: 0.5
+  photometric_strength: 0.08
+  horizontal_flip_prob: 0.5
+
+model:
+  style_dim: 512
+  motion_dim: 64
+  scale: 1
+
+training:
+  # 2 clips/GPU x 16 GPUs x 4 accumulation = 128 clips/update.
+  max_steps: 50000
+  warmup_steps: 1000
+  min_lr_ratio: 0.10
+  lr: 0.0001
+  discriminator_lr: 0.0001
+  betas: [0.9, 0.95]
+  discriminator_betas: [0.0, 0.99]
+  weight_decay: 0.0
+  discriminator_weight_decay: 0.0
+  accumulation_steps: 4
+  grad_clip: 1.0
+  discriminator_grad_clip: 5.0
+  dtype: bf16
+  render_chunk: 2
+  log_interval: 20
+  preview_interval: 500
+  eval_interval: 1000
+  validation_batches: 8
+  save_interval: 5000
+
+stages:
+  image_gan_start: 5000
+
+loss:
+  reconstruction: 1.0
+  perceptual: 0.10
+  image_adversarial: 0.10
+  # Across 16 GPUs x 4 accumulation this is still 128 sampled frames/update.
+  max_perceptual_frames: 2
+  max_gan_frames: 2
+  vgg_weights_path: checkpoints/motion_tokenizer/vgg16-397923af.pth
+
+image_discriminator:
+  scales: 3
+  base_channels: 64
+  max_channels: 512
+  num_layers: 5

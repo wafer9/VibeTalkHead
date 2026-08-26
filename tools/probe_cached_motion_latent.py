@@ -64,12 +64,10 @@ def load_motion_tokenizer(
     checkpoint_path: str, device: torch.device
 ) -> tuple[MotionTokenizer, int]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = checkpoint["config"]["model"]
-    config = dict(config)
-    config["gradient_checkpointing"] = False
+    config = dict(checkpoint["config"]["model"])
     model = MotionTokenizer(**config)
     model.load_state_dict(checkpoint["model"], strict=True)
-    input_size = int(config.get("motion_input_size", 256))
+    input_size = int(checkpoint["config"]["data"]["image_size"])
     del checkpoint
     return model.to(device).eval(), input_size
 

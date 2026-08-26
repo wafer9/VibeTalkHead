@@ -46,11 +46,11 @@ rank=$2
 train_set="zh"
 echo ${num_nodes} ${rank}
 
-dir=exp/motion_tokenizer_256_liax_fused
+dir=exp/motion_tokenizer_liax_official
 tensorboard_dir=${dir}/tensorboard
 num_workers=4
 prefetch=2
-motion_tokenizer_config=conf/motion_tokenizer_256_liax.yaml
+motion_tokenizer_config=conf/motion_tokenizer_liax_official.yaml
 
 train_engine=torch_ddp # torch_ddp deepspeed
 train_config=conf/run_stage1.yaml

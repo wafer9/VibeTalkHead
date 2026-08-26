@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Extract normalized first-frame-relative 64-D motion tokens."""
+"""Extract the absolute alpha coefficients learned by official LIA-X."""
 
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ def read_record(stream, offset: int):
 
 
 @torch.inference_mode()
-def encode_video(model, path: str, target_fps: float, batch_frames: int, device):
+def encode_video(model, path: str, target_fps: float, batch_frames: int,
+                 image_size: int, device):
     reader = VideoReader(path, ctx=cpu(0), num_threads=4)
     source_fps = float(reader.get_avg_fps() or target_fps)
     step = source_fps / target_fps
@@ -62,17 +63,13 @@ def encode_video(model, path: str, target_fps: float, batch_frames: int, device)
         frames = torch.from_numpy(reader.get_batch(indices[start:start + batch_frames]).asnumpy())
         frames = frames.permute(0, 3, 1, 2).to(device=device, dtype=torch.float32).div_(127.5).sub_(1)
         frames = F.interpolate(
-            frames, size=(model.motion_input_size, model.motion_input_size),
+            frames, size=(image_size, image_size),
             mode="bilinear", align_corners=False, antialias=True,
         )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             motion = model.encode_motion(frames)
         chunks.append(motion.float().cpu())
-    absolute_motion = torch.cat(chunks, dim=0)
-    # The first decoded frame is the no-motion origin. Delta normalization is
-    # scale-only, so token[0] remains exactly zero.
-    motion_delta = absolute_motion - absolute_motion[:1]
-    return model.normalizer.normalize_delta(motion_delta)
+    return torch.cat(chunks, dim=0)
 
 
 def main():
@@ -81,9 +78,8 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model = MotionTokenizer(**checkpoint["config"]["model"])
     model.load_state_dict(checkpoint["model"], strict=True)
-    if not bool(model.normalizer.ready.item()):
-        raise RuntimeError("checkpoint normalizer is not finalized; do not export unstable raw latents")
     model = model.to(device).eval()
+    image_size = int(checkpoint["config"]["data"]["image_size"])
 
     if rank == 0:
         build_jsonl_index(args.manifest)
@@ -108,17 +104,18 @@ def main():
             else:
                 try:
                     video_path = resolve_video_path(record["video_path"], args.video_root)
-                    motion = encode_video(model, video_path, args.target_fps, args.batch_frames, device)
+                    motion = encode_video(
+                        model, video_path, args.target_fps, args.batch_frames,
+                        image_size, device,
+                    )
                     os.makedirs(output_dir, exist_ok=True)
                     temporary = output_path + f".tmp.{os.getpid()}"
                     torch.save({
                         "motion": motion.half(),
                         "fps": args.target_fps,
                         "motion_dim": model.motion_dim,
-                        "normalized": True,
-                        "representation": "first_frame_relative_delta",
-                        "normalization": "scale_only_std",
-                        "zero_origin_frame": 0,
+                        "normalized": False,
+                        "representation": "liax_absolute_alpha",
                         "source_checkpoint": os.path.abspath(args.checkpoint),
                     }, temporary)
                     os.replace(temporary, output_path)

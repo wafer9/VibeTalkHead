@@ -1,13 +1,5 @@
 #!/usr/bin/env python
-"""Train the strict two-branch talking-head motion tokenizer.
-
-Single GPU:
-  python -m twinlakes.bin.train_motion_tokenizer --config conf/motion_tokenizer.yaml
-
-Distributed:
-  torchrun --nproc_per_node=8 -m twinlakes.bin.train_motion_tokenizer \
-      --config conf/motion_tokenizer.yaml
-"""
+"""Train the vendored official LIA-X encoder/decoder."""
 
 from __future__ import annotations
 
@@ -22,7 +14,6 @@ import random
 import re
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -34,72 +25,47 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid, save_image
 
-from twinlakes.motion_tokenizer.data import (
-    JsonlVideoClipDataset,
-    build_jsonl_index,
-    seed_worker,
-)
+from twinlakes.motion_tokenizer.data import JsonlVideoClipDataset, build_jsonl_index, seed_worker
 from twinlakes.motion_tokenizer.losses import (
-    FrozenFANMouthVelocityLoss,
-    LaplacianPyramidLoss,
     LocalVGGPerceptualLoss,
     MultiScaleImageDiscriminator,
-    TorchScriptIdentityLoss,
-    VideoDiscriminator,
-    charbonnier,
-    color_statistics_loss,
-    covariance_loss,
     discriminator_hinge,
-    feature_matching_loss,
-    flow_total_variation,
     generator_hinge,
-    gradient_loss,
-    motion_moment_loss,
-    region_weighted_loss,
     set_requires_grad,
-    temporal_relation_loss,
 )
 from twinlakes.motion_tokenizer.model import MotionTokenizer
 
+LOG = logging.getLogger("liax_motion_tokenizer")
 
-LOG = logging.getLogger("motion_tokenizer")
 
-
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--resume", default=None, help="checkpoint path, 'latest', or empty")
-    parser.add_argument("--max_steps", type=int, default=None, help="override for smoke/short runs")
-    parser.add_argument("--train_manifest", default=None)
-    parser.add_argument("--val_manifest", default=None)
-    parser.add_argument("--num_workers", type=int, default=None)
-    parser.add_argument("--batch_size", type=int, default=None, help="override per-rank batch size")
-    parser.add_argument("--render_chunk", type=int, default=None, help="override renderer micro-chunk")
-    parser.add_argument("--log_interval", type=int, default=None, help="override logging interval")
-    parser.add_argument(
-        "--skip_final_save", action="store_true",
-        help="skip the terminal checkpoint (intended for smoke tests only)",
-    )
+    parser.add_argument("--output_dir")
+    parser.add_argument("--resume")
+    parser.add_argument("--max_steps", type=int)
+    parser.add_argument("--train_manifest")
+    parser.add_argument("--val_manifest")
+    parser.add_argument("--num_workers", type=int)
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--render_chunk", type=int)
+    parser.add_argument("--accumulation_steps", type=int)
+    parser.add_argument("--image_gan_start", type=int)
+    parser.add_argument("--log_interval", type=int)
+    parser.add_argument("--skip_final_save", action="store_true")
     return parser.parse_args()
 
 
-def distributed_info() -> Tuple[int, int, int]:
-    return (
-        int(os.environ.get("RANK", "0")),
-        int(os.environ.get("LOCAL_RANK", "0")),
-        int(os.environ.get("WORLD_SIZE", "1")),
-    )
-
-
-def setup_distributed() -> Tuple[int, int, int, torch.device]:
-    rank, local_rank, world_size = distributed_info()
+def distributed_setup():
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
     else:
         device = torch.device("cpu")
-    if world_size > 1 and not dist.is_initialized():
+    if world_size > 1:
         backend = "nccl" if device.type == "cuda" else "gloo"
         if backend == "nccl":
             dist.init_process_group(backend, device_id=device)
@@ -108,24 +74,17 @@ def setup_distributed() -> Tuple[int, int, int, torch.device]:
     return rank, local_rank, world_size, device
 
 
-def barrier() -> None:
+def barrier():
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
 
-@torch.no_grad()
-def distributed_mean_scalars(values: Dict[str, torch.Tensor]) -> Dict[str, float]:
-    """Average scalar diagnostics over ranks with one small collective."""
-    names = list(values)
-    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-        packed.div_(dist.get_world_size())
-    return {name: float(value.item()) for name, value in zip(names, packed)}
+def raw_module(module):
+    return module.module if isinstance(module, DDP) else module
 
 
-def seed_everything(seed: int, rank: int) -> torch.Generator:
-    seed = seed + rank * 100003
+def seed_all(seed, rank):
+    seed += rank * 100003
     random.seed(seed)
     np.random.seed(seed % (2 ** 32))
     torch.manual_seed(seed)
@@ -136,64 +95,30 @@ def seed_everything(seed: int, rank: int) -> torch.Generator:
     return generator
 
 
-def raw_module(module):
-    return module.module if isinstance(module, DDP) else module
-
-
-def model_parameter_groups(model: MotionTokenizer, config: Dict) -> list:
-    motion_ids = {id(parameter) for parameter in model.motion_parameters()}
-    motion = [parameter for parameter in model.parameters() if id(parameter) in motion_ids]
-    main = [parameter for parameter in model.parameters() if id(parameter) not in motion_ids]
-    lr = float(config["lr"])
-    return [
-        {"params": main, "lr": lr, "initial_lr": lr, "name": "main"},
-        {
-            "params": motion,
-            "lr": lr * float(config.get("motion_lr_multiplier", 1.0)),
-            "initial_lr": lr * float(config.get("motion_lr_multiplier", 1.0)),
-            "name": "motion",
-        },
-    ]
-
-
-def cosine_lr(step: int, total_steps: int, warmup_steps: int) -> float:
-    if step < warmup_steps:
-        return max(step + 1, 1) / max(warmup_steps, 1)
-    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    return 0.5 * (1 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
-
-
-def set_learning_rates(optimizer, step: int, training: Dict, normalizer_ready: bool) -> None:
-    scale = cosine_lr(step, int(training["max_steps"]), int(training.get("warmup_steps", 0)))
-    min_scale = float(training.get("min_lr_ratio", 0.05))
-    scale = min_scale + (1 - min_scale) * scale
-    freeze_motion = bool(training.get("freeze_motion_after_normalizer", True)) and normalizer_ready
-    for group in optimizer.param_groups:
-        if group.get("name") == "motion" and freeze_motion:
-            group["lr"] = 0.0
-        else:
-            group["lr"] = group["initial_lr"] * scale
-
-
-def stage_strength(step: int, start: int, ramp: int = 0) -> float:
-    if start < 0 or step < start:
-        return 0.0
-    if ramp <= 0:
-        return 1.0
-    return min((step - start + 1) / ramp, 1.0)
-
-
-def autocast_context(device: torch.device, dtype: str):
+def autocast_context(device, dtype):
     if device.type != "cuda" or dtype == "fp32":
         return contextlib.nullcontext()
-    amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
-    return torch.autocast(device_type="cuda", dtype=amp_dtype)
+    return torch.autocast(
+        device_type="cuda",
+        dtype=torch.bfloat16 if dtype == "bf16" else torch.float16,
+    )
 
 
-def flatten_selected_frame_pairs(
-    prediction: torch.Tensor, target: torch.Tensor, maximum: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Select identical flattened frame indices for paired GAN features."""
+def set_lr(optimizer, step, training):
+    warmup = int(training.get("warmup_steps", 0))
+    maximum = int(training["max_steps"])
+    if step < warmup:
+        scale = max(step + 1, 1) / max(warmup, 1)
+    else:
+        progress = min(max((step - warmup) / max(maximum - warmup, 1), 0.0), 1.0)
+        scale = 0.5 * (1 + math.cos(math.pi * progress))
+    minimum = float(training.get("min_lr_ratio", 0.1))
+    lr = float(training["lr"]) * (minimum + (1 - minimum) * scale)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def select_pairs(prediction, target, maximum):
     prediction = prediction.flatten(0, 1)
     target = target.flatten(0, 1)
     if maximum > 0 and prediction.shape[0] > maximum:
@@ -203,233 +128,76 @@ def flatten_selected_frame_pairs(
     return prediction, target
 
 
-def compute_generator_losses(
-    output: Dict[str, torch.Tensor],
-    target: torch.Tensor,
-    reference: torch.Tensor,
-    loss_config: Dict,
-    laplacian: LaplacianPyramidLoss,
-    perceptual: LocalVGGPerceptualLoss,
-    identity: TorchScriptIdentityLoss,
-    mouth_velocity: FrozenFANMouthVelocityLoss,
-    image_discriminator: Optional[torch.nn.Module],
-    video_discriminator: Optional[torch.nn.Module],
-    image_gan_active: bool,
-    video_gan_active: bool,
-) -> Dict[str, torch.Tensor]:
-    reconstruction = output["reconstruction"]
-    losses: Dict[str, torch.Tensor] = {}
-    zero = reconstruction.new_zeros(())
-    losses["reconstruction"] = charbonnier(reconstruction, target)
-    losses["laplacian"] = (
-        laplacian(reconstruction, target)
-        if float(loss_config.get("laplacian", 0.0)) != 0 else zero
-    )
-    losses["gradient"] = (
-        gradient_loss(reconstruction, target)
-        if float(loss_config.get("gradient", 0.0)) != 0 else zero
-    )
-    losses["region"] = (
-        region_weighted_loss(reconstruction, target)
-        if float(loss_config.get("region", 0.0)) != 0 else zero
-    )
-    if (
-        float(loss_config.get("temporal_velocity", 0.0)) != 0
-        or float(loss_config.get("temporal_acceleration", 0.0)) != 0
-    ):
-        velocity, acceleration = temporal_relation_loss(reconstruction, target)
-        losses["temporal_velocity"] = velocity
-        losses["temporal_acceleration"] = acceleration
-    else:
-        losses["temporal_velocity"] = zero
-        losses["temporal_acceleration"] = zero
-    if mouth_velocity.enabled and (
-        float(loss_config.get("mouth_landmark_velocity", 0.0)) != 0
-        or float(loss_config.get("mouth_openness_velocity", 0.0)) != 0
-    ):
-        losses.update(mouth_velocity(reconstruction, target))
-    else:
-        losses.update({
-            "mouth_landmark_velocity": zero,
-            "mouth_openness_velocity": zero,
-            "mouth_landmark_confidence": zero,
-            "mouth_landmark_valid": zero,
-            "mouth_input_grad_norm": zero,
-            "mouth_input_grad_clipped": zero,
-        })
-    losses["flow_tv"] = (
-        flow_total_variation(output["flow"])
-        if float(loss_config.get("flow_tv", 0.0)) != 0 else zero
-    )
-    losses["covariance"] = (
-        covariance_loss(output["motion_delta"])
-        if float(loss_config.get("covariance", 0.0)) != 0 else zero
-    )
-    if float(loss_config.get("motion_moment", 0.0)) != 0:
-        losses["motion_moment"] = motion_moment_loss(
-            output["motion_delta"], float(loss_config.get("motion_target_std", 0.20))
+def generator_losses(output, target, config, perceptual, discriminator, gan_active):
+    prediction = output["reconstruction"]
+    zero = prediction.new_zeros(())
+    losses = {
+        "reconstruction": F.l1_loss(prediction, target),
+        "perceptual": zero,
+        "image_adversarial": zero,
+    }
+    if float(config.get("perceptual", 0.0)) != 0:
+        fake, real = select_pairs(
+            prediction, target, int(config.get("max_perceptual_frames", 8))
         )
-    else:
-        losses["motion_moment"] = zero
-    losses["motion_sparsity"] = (
-        output["target_motion"].abs().mean()
-        if float(loss_config.get("motion_sparsity", 0.0)) != 0 else zero
+        losses["perceptual"] = perceptual(fake, real)
+    if gan_active:
+        fake, _ = select_pairs(prediction, target, int(config.get("max_gan_frames", 8)))
+        losses["image_adversarial"] = generator_hinge(discriminator(fake))
+    losses["total"] = sum(
+        float(config.get(name, 0.0)) * value for name, value in losses.items()
     )
-    perceptual_weight = float(loss_config.get("perceptual", 0.0))
-    if perceptual.enabled and perceptual_weight != 0:
-        prediction_frames = reconstruction.flatten(0, 1)
-        target_frames = target.flatten(0, 1)
-        maximum = int(loss_config.get("max_perceptual_frames", 4))
-        if maximum > 0 and prediction_frames.shape[0] > maximum:
-            indices = torch.randperm(prediction_frames.shape[0], device=prediction_frames.device)[:maximum]
-            prediction_frames = prediction_frames[indices]
-            target_frames = target_frames[indices]
-        losses["perceptual"] = perceptual(prediction_frames, target_frames)
-    else:
-        losses["perceptual"] = reconstruction.new_zeros(())
-
-    # Same-identity reconstruction identity; evaluate only one frame per clip.
-    if identity.enabled and float(loss_config.get("identity", 0.0)) != 0:
-        losses["identity"] = identity(
-            reconstruction[:, reconstruction.shape[1] // 2], reference
-        )
-    else:
-        losses["identity"] = reconstruction.new_zeros(())
-
-    if "noisy_reconstruction" in output:
-        noisy = output["noisy_reconstruction"]
-        losses["noisy_reconstruction"] = charbonnier(noisy, target)
-        losses["noise_consistency"] = charbonnier(noisy, reconstruction.detach())
-        noisy_velocity, _ = temporal_relation_loss(noisy, target)
-        losses["noisy_temporal"] = noisy_velocity
-    else:
-        zero = reconstruction.new_zeros(())
-        losses.update({
-            "noisy_reconstruction": zero,
-            "noise_consistency": zero,
-            "noisy_temporal": zero,
-        })
-
-    if "cross_reconstruction" in output:
-        losses["cross_motion_cycle"] = F.smooth_l1_loss(
-            output["cross_cycle_delta"], output["cross_target_delta"].detach()
-        )
-        losses["cross_appearance"] = color_statistics_loss(
-            output["cross_reconstruction"], output["cross_reference"]
-        )
-        if identity.enabled and float(loss_config.get("cross_identity", 0.0)) != 0:
-            losses["cross_identity"] = identity(
-                output["cross_reconstruction"], output["cross_reference"]
-            )
-        else:
-            losses["cross_identity"] = reconstruction.new_zeros(())
-    else:
-        zero = reconstruction.new_zeros(())
-        losses.update({
-            "cross_motion_cycle": zero,
-            "cross_appearance": zero,
-            "cross_identity": zero,
-        })
-
-    if image_gan_active and image_discriminator is not None:
-        maximum = int(loss_config.get("max_gan_frames", 8))
-        fake, real = flatten_selected_frame_pairs(reconstruction, target, maximum)
-        feature_matching_active = float(loss_config.get("feature_matching", 0.0)) != 0
-        if feature_matching_active:
-            with torch.no_grad():
-                real_outputs = image_discriminator(real, return_features=True)
-            fake_outputs = image_discriminator(fake, return_features=True)
-            losses["feature_matching"] = feature_matching_loss(
-                real_outputs, fake_outputs
-            )
-        else:
-            fake_outputs = image_discriminator(fake, return_features=False)
-            losses["feature_matching"] = reconstruction.new_zeros(())
-        losses["image_adversarial"] = generator_hinge(fake_outputs)
-    else:
-        zero = reconstruction.new_zeros(())
-        losses["image_adversarial"] = zero
-        losses["feature_matching"] = zero
-
-    if video_gan_active and video_discriminator is not None:
-        spatial = int(loss_config.get("video_gan_size", 128))
-        fake_video = F.interpolate(
-            reconstruction.flatten(0, 1), size=(spatial, spatial),
-            mode="bilinear", align_corners=False, antialias=True,
-        ).reshape(*reconstruction.shape[:3], spatial, spatial)
-        losses["video_adversarial"] = -video_discriminator(fake_video).mean()
-    else:
-        losses["video_adversarial"] = reconstruction.new_zeros(())
-
-    total = reconstruction.new_zeros(())
-    for name, value in losses.items():
-        total = total + float(loss_config.get(name, 0.0)) * value
-    losses["total"] = total
     return losses
 
 
-def compute_discriminator_losses(
-    output: Dict[str, torch.Tensor],
-    target: torch.Tensor,
-    loss_config: Dict,
-    image_discriminator: Optional[torch.nn.Module],
-    video_discriminator: Optional[torch.nn.Module],
-    image_active: bool,
-    video_active: bool,
-) -> Dict[str, torch.Tensor]:
-    reconstruction = output["reconstruction"].detach()
-    result = {"image_discriminator": reconstruction.new_zeros(()),
-              "video_discriminator": reconstruction.new_zeros(())}
-    if image_active and image_discriminator is not None:
-        maximum = int(loss_config.get("max_gan_frames", 8))
-        fake, real = flatten_selected_frame_pairs(reconstruction, target, maximum)
-        result["image_discriminator"] = discriminator_hinge(
-            image_discriminator(real), image_discriminator(fake)
-        )
-    if video_active and video_discriminator is not None:
-        spatial = int(loss_config.get("video_gan_size", 128))
-        fake = F.interpolate(
-            reconstruction.flatten(0, 1), size=(spatial, spatial),
-            mode="bilinear", align_corners=False, antialias=True,
-        ).reshape(*reconstruction.shape[:3], spatial, spatial)
-        real = F.interpolate(
-            target.flatten(0, 1), size=(spatial, spatial),
-            mode="bilinear", align_corners=False, antialias=True,
-        ).reshape(*target.shape[:3], spatial, spatial)
-        real_logits = video_discriminator(real)
-        fake_logits = video_discriminator(fake)
-        result["video_discriminator"] = F.relu(1 - real_logits).mean() + F.relu(1 + fake_logits).mean()
-    result["total"] = result["image_discriminator"] + result["video_discriminator"]
-    return result
+def discriminator_loss(output, target, config, discriminator):
+    fake, real = select_pairs(
+        output["reconstruction"].detach(),
+        target,
+        int(config.get("max_gan_frames", 8)),
+    )
+    return discriminator_hinge(discriminator(real), discriminator(fake))
+
+
+def temporal_errors(prediction, target):
+    if prediction.shape[1] < 2:
+        zero = prediction.new_zeros(())
+        return zero, zero
+    pred_v = prediction[:, 1:] - prediction[:, :-1]
+    target_v = target[:, 1:] - target[:, :-1]
+    velocity = F.l1_loss(pred_v, target_v)
+    if prediction.shape[1] < 3:
+        return velocity, prediction.new_zeros(())
+    return velocity, F.l1_loss(
+        pred_v[:, 1:] - pred_v[:, :-1],
+        target_v[:, 1:] - target_v[:, :-1],
+    )
 
 
 @torch.no_grad()
-def validate(
-    model,
-    loader: DataLoader,
-    device: torch.device,
-    config: Dict,
-    causal_strength: float,
-) -> Dict[str, float]:
+def validate(model, loader, device, config):
     model.eval()
     totals = torch.zeros(5, device=device, dtype=torch.float64)
-    limit = int(config["training"].get("validation_batches", 8))
-    for batch_index, batch in enumerate(loader):
-        if batch_index >= limit:
+    for index, batch in enumerate(loader):
+        if index >= int(config["training"].get("validation_batches", 8)):
             break
         reference = batch["reference"].to(device, non_blocking=True)
         target = batch["frames"].to(device, non_blocking=True)
         with autocast_context(device, config["training"].get("dtype", "bf16")):
-            output = model(
-                reference, target, causal_strength=causal_strength,
-                render_chunk=int(config["training"].get("render_chunk", 4)),
-            )
-        prediction = output["reconstruction"].float()
-        target = target.float()
-        l1 = (prediction - target).abs().mean()
-        mse = (prediction - target).square().mean()
-        velocity, acceleration = temporal_relation_loss(prediction, target)
-        totals += torch.tensor([l1, mse, velocity, acceleration, 1.0], device=device, dtype=torch.float64)
+            prediction = model(
+                reference,
+                target,
+                render_chunk=int(config["training"].get("render_chunk", 1)),
+            )["reconstruction"]
+        prediction, target = prediction.float(), target.float()
+        velocity, acceleration = temporal_errors(prediction, target)
+        totals += torch.stack([
+            F.l1_loss(prediction, target).double(),
+            F.mse_loss(prediction, target).double(),
+            velocity.double(),
+            acceleration.double(),
+            prediction.new_ones(()).double(),
+        ])
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(totals)
     count = totals[-1].clamp_min(1)
@@ -437,40 +205,38 @@ def validate(
     model.train()
     return {
         "l1": float((totals[0] / count).item()),
-        "psnr": -10.0 * math.log10(max(mse / 4.0, 1e-12)),  # images are in [-1,1]
+        "psnr": -10 * math.log10(max(mse / 4.0, 1e-12)),
         "velocity": float((totals[2] / count).item()),
         "acceleration": float((totals[3] / count).item()),
     }
 
 
-def latest_checkpoint(output_dir: str) -> Optional[str]:
-    checkpoints = []
+@torch.no_grad()
+def reduce_scalars(values):
+    names = list(values)
+    packed = torch.stack([values[name].detach().float().reshape(()) for name in names])
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(packed)
+        packed.div_(dist.get_world_size())
+    return {name: float(value.item()) for name, value in zip(names, packed)}
+
+
+def latest_checkpoint(output_dir):
+    found = []
     for path in Path(output_dir).glob("step_*.pt"):
         match = re.search(r"step_(\d+)\.pt$", path.name)
         if match:
-            checkpoints.append((int(match.group(1)), str(path)))
-    return max(checkpoints)[1] if checkpoints else None
+            found.append((int(match.group(1)), str(path)))
+    return max(found)[1] if found else None
 
 
-def save_checkpoint(
-    path: str,
-    model,
-    image_discriminator,
-    video_discriminator,
-    generator_optimizer,
-    discriminator_optimizer,
-    scaler,
-    step: int,
-    epoch: int,
-    config: Dict,
-) -> None:
+def save_checkpoint(path, model, discriminator, g_optimizer, d_optimizer, scaler, step, epoch, config):
     payload = {
         "model": raw_module(model).state_dict(),
-        "image_discriminator": raw_module(image_discriminator).state_dict() if image_discriminator else None,
-        "video_discriminator": raw_module(video_discriminator).state_dict() if video_discriminator else None,
-        "generator_optimizer": generator_optimizer.state_dict(),
-        "discriminator_optimizer": discriminator_optimizer.state_dict() if discriminator_optimizer else None,
-        "scaler": scaler.state_dict() if scaler is not None else None,
+        "image_discriminator": raw_module(discriminator).state_dict() if discriminator else None,
+        "generator_optimizer": g_optimizer.state_dict(),
+        "discriminator_optimizer": d_optimizer.state_dict() if d_optimizer else None,
+        "scaler": scaler.state_dict(),
         "step": step,
         "epoch": epoch,
         "config": config,
@@ -480,494 +246,318 @@ def save_checkpoint(
     os.replace(temporary, path)
 
 
-def load_checkpoint(
-    path: str,
-    model,
-    image_discriminator,
-    video_discriminator,
-    generator_optimizer,
-    discriminator_optimizer,
-    scaler,
-) -> Tuple[int, int]:
+def load_checkpoint(path, model, discriminator, g_optimizer, d_optimizer, scaler):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     raw_module(model).load_state_dict(payload["model"], strict=True)
-    if image_discriminator is not None and payload.get("image_discriminator") is not None:
-        raw_module(image_discriminator).load_state_dict(payload["image_discriminator"])
-    if video_discriminator is not None and payload.get("video_discriminator") is not None:
-        raw_module(video_discriminator).load_state_dict(payload["video_discriminator"])
-    generator_optimizer.load_state_dict(payload["generator_optimizer"])
-    if discriminator_optimizer is not None and payload.get("discriminator_optimizer") is not None:
-        discriminator_optimizer.load_state_dict(payload["discriminator_optimizer"])
-    if scaler is not None and payload.get("scaler") is not None:
+    if discriminator and payload.get("image_discriminator") is not None:
+        raw_module(discriminator).load_state_dict(payload["image_discriminator"], strict=True)
+    g_optimizer.load_state_dict(payload["generator_optimizer"])
+    if d_optimizer and payload.get("discriminator_optimizer") is not None:
+        d_optimizer.load_state_dict(payload["discriminator_optimizer"])
+    if payload.get("scaler") is not None:
         scaler.load_state_dict(payload["scaler"])
     return int(payload.get("step", 0)), int(payload.get("epoch", 0))
 
 
-def save_preview(path: str, reference: torch.Tensor, target: torch.Tensor,
-                 prediction: torch.Tensor, maximum_frames: int = 6) -> None:
-    count = min(target.shape[1], maximum_frames)
+def save_preview(path, reference, target, prediction):
+    count = min(target.shape[1], 6)
     indices = torch.linspace(0, target.shape[1] - 1, count, device=target.device).long()
     images = [reference[0]]
     for index in indices:
         images.extend([target[0, index], prediction[0, index]])
-    grid = make_grid(torch.stack(images).add(1).mul(0.5).clamp(0, 1), nrow=1 + 2 * count)
-    save_image(grid, path)
+    save_image(
+        make_grid(torch.stack(images).add(1).mul(0.5).clamp(0, 1), nrow=1 + 2 * count),
+        path,
+    )
 
 
-def main() -> None:
+def build_loaders(config, rank, world_size, generator):
+    data = config["data"]
+    common = dict(
+        video_root=data["video_root"],
+        clip_length=int(data["clip_length"]),
+        image_size=int(data["image_size"]),
+        target_fps=float(data.get("target_fps", 25)),
+        max_retries=int(data.get("max_retries", 12)),
+    )
+    train_set = JsonlVideoClipDataset(
+        data["train_manifest"],
+        training=True,
+        first_frame_reference_prob=float(data.get("first_frame_reference_prob", 0.5)),
+        photometric_strength=float(data.get("photometric_strength", 0.08)),
+        horizontal_flip_prob=float(data.get("horizontal_flip_prob", 0.5)),
+        return_cross_reference=False,
+        max_samples=int(data.get("max_train_samples", 0)),
+        **common,
+    )
+    val_set = JsonlVideoClipDataset(
+        data["val_manifest"],
+        training=False,
+        photometric_strength=0,
+        horizontal_flip_prob=0,
+        return_cross_reference=False,
+        max_samples=int(data.get("max_val_samples", 0)),
+        **common,
+    )
+    train_sampler = (
+        DistributedSampler(train_set, world_size, rank, shuffle=True, seed=int(config.get("seed", 2026)))
+        if world_size > 1 else None
+    )
+    val_sampler = (
+        DistributedSampler(val_set, world_size, rank, shuffle=False)
+        if world_size > 1 else None
+    )
+    workers = int(data.get("num_workers", 4))
+    kwargs = dict(
+        batch_size=int(data["batch_size"]),
+        num_workers=workers,
+        pin_memory=bool(data.get("pin_memory", True)),
+        persistent_workers=workers > 0,
+        worker_init_fn=seed_worker,
+        generator=generator,
+    )
+    if workers:
+        kwargs["prefetch_factor"] = int(data.get("prefetch_factor", 2))
+    train_loader = DataLoader(
+        train_set, sampler=train_sampler, shuffle=train_sampler is None,
+        drop_last=True, **kwargs,
+    )
+    val_kwargs = copy.copy(kwargs)
+    val_kwargs["batch_size"] = int(data.get("val_batch_size", 1))
+    val_loader = DataLoader(
+        val_set, sampler=val_sampler, shuffle=False, drop_last=False, **val_kwargs,
+    )
+    return train_set, val_set, train_sampler, train_loader, val_loader
+
+
+def main():
     args = parse_args()
-    with open(args.config, "r") as stream:
+    with open(args.config) as stream:
         config = yaml.safe_load(stream)
-    if args.output_dir:
-        config["output_dir"] = args.output_dir
-    if args.train_manifest:
-        config["data"]["train_manifest"] = args.train_manifest
-    if args.val_manifest:
-        config["data"]["val_manifest"] = args.val_manifest
-    if args.num_workers is not None:
-        config["data"]["num_workers"] = args.num_workers
-    if args.batch_size is not None:
-        config["data"]["batch_size"] = args.batch_size
-    if args.render_chunk is not None:
-        config["training"]["render_chunk"] = args.render_chunk
-    if args.log_interval is not None:
-        config["training"]["log_interval"] = args.log_interval
-    if args.max_steps is not None:
-        config["training"]["max_steps"] = args.max_steps
+    for argument, section, key in (
+        ("output_dir", None, "output_dir"),
+        ("train_manifest", "data", "train_manifest"),
+        ("val_manifest", "data", "val_manifest"),
+        ("num_workers", "data", "num_workers"),
+        ("batch_size", "data", "batch_size"),
+        ("render_chunk", "training", "render_chunk"),
+        ("accumulation_steps", "training", "accumulation_steps"),
+        ("image_gan_start", "stages", "image_gan_start"),
+        ("log_interval", "training", "log_interval"),
+        ("max_steps", "training", "max_steps"),
+    ):
+        value = getattr(args, argument)
+        if value is not None:
+            if section is None:
+                config[key] = value
+            else:
+                config[section][key] = value
 
-    rank, local_rank, world_size, device = setup_distributed()
+    rank, local_rank, world_size, device = distributed_setup()
     logging.basicConfig(
         level=logging.INFO if rank == 0 else logging.WARNING,
         format="%(asctime)s %(levelname)s %(message)s",
     )
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    generator = seed_everything(int(config.get("seed", 2026)), rank)
+    generator = seed_all(int(config.get("seed", 2026)), rank)
     output_dir = os.path.abspath(config["output_dir"])
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
         with open(os.path.join(output_dir, "train.yaml"), "w") as stream:
             yaml.safe_dump(config, stream, sort_keys=False, allow_unicode=True)
-
-    # The 609 MB manifest is indexed once on rank zero, then mmap'ed by all workers.
-    if rank == 0:
         for key in ("train_manifest", "val_manifest"):
             build_jsonl_index(config["data"][key])
     barrier()
 
-    cross_enabled = int(config["stages"].get("cross_identity_start", -1)) >= 0
-    common_data = dict(
-        video_root=config["data"]["video_root"],
-        clip_length=int(config["data"]["clip_length"]),
-        image_size=int(config["data"]["image_size"]),
-        target_fps=float(config["data"].get("target_fps", 25)),
+    train_set, val_set, train_sampler, train_loader, val_loader = build_loaders(
+        config, rank, world_size, generator
     )
-    train_dataset = JsonlVideoClipDataset(
-        config["data"]["train_manifest"], training=True,
-        first_frame_reference_prob=float(config["data"].get("first_frame_reference_prob", 0.5)),
-        photometric_strength=float(config["data"].get("photometric_strength", 0.12)),
-        horizontal_flip_prob=float(config["data"].get("horizontal_flip_prob", 0.5)),
-        # Cross references are formed from another local sample or another DDP
-        # rank below, avoiding a second VideoReader open for every training item.
-        return_cross_reference=False,
-        max_retries=int(config["data"].get("max_retries", 12)),
-        max_samples=int(config["data"].get("max_train_samples", 0)),
-        **common_data,
-    )
-    val_dataset = JsonlVideoClipDataset(
-        config["data"]["val_manifest"], training=False,
-        return_cross_reference=False, photometric_strength=0,
-        horizontal_flip_prob=0, max_retries=int(config["data"].get("max_retries", 12)),
-        max_samples=int(config["data"].get("max_val_samples", 0)),
-        **common_data,
-    )
-    train_sampler = DistributedSampler(
-        train_dataset, world_size, rank, shuffle=True, seed=int(config.get("seed", 2026))
-    ) if world_size > 1 else None
-    val_sampler = DistributedSampler(
-        val_dataset, world_size, rank, shuffle=False
-    ) if world_size > 1 else None
-    loader_kwargs = dict(
-        batch_size=int(config["data"]["batch_size"]),
-        num_workers=int(config["data"].get("num_workers", 4)),
-        pin_memory=bool(config["data"].get("pin_memory", True)),
-        persistent_workers=int(config["data"].get("num_workers", 4)) > 0,
-        worker_init_fn=seed_worker,
-        generator=generator,
-    )
-    if loader_kwargs["num_workers"] > 0:
-        loader_kwargs["prefetch_factor"] = int(config["data"].get("prefetch_factor", 2))
-    train_loader = DataLoader(
-        train_dataset, sampler=train_sampler, shuffle=train_sampler is None,
-        drop_last=True, **loader_kwargs,
-    )
-    val_loader_kwargs = copy.copy(loader_kwargs)
-    val_loader_kwargs["batch_size"] = int(config["data"].get("val_batch_size", 1))
-    val_loader = DataLoader(
-        val_dataset, sampler=val_sampler, shuffle=False, drop_last=False,
-        **val_loader_kwargs,
-    )
-
     model = MotionTokenizer(**config["model"]).to(device)
-    image_discriminator = MultiScaleImageDiscriminator(
-        **config.get("image_discriminator", {})
-    ).to(device) if int(config["stages"].get("image_gan_start", -1)) >= 0 else None
-    video_discriminator = VideoDiscriminator(
-        **config.get("video_discriminator", {})
-    ).to(device) if int(config["stages"].get("video_gan_start", -1)) >= 0 else None
-
-    training = config["training"]
-    if bool(training.get("freeze_motion_encoder", False)):
-        model.set_motion_encoder_requires_grad(False)
-    generator_optimizer = torch.optim.AdamW(
-        model_parameter_groups(model, training),
-        betas=tuple(training.get("betas", [0.9, 0.95])),
-        weight_decay=float(training.get("weight_decay", 0.01)),
+    training, loss_config = config["training"], config["loss"]
+    gan_start = int(config["stages"].get("image_gan_start", -1))
+    discriminator = (
+        MultiScaleImageDiscriminator(**config["image_discriminator"]).to(device)
+        if gan_start >= 0 else None
     )
-    discriminator_parameters = []
-    if image_discriminator is not None:
-        discriminator_parameters.extend(image_discriminator.parameters())
-    if video_discriminator is not None:
-        discriminator_parameters.extend(video_discriminator.parameters())
-    discriminator_optimizer = torch.optim.AdamW(
-        discriminator_parameters,
-        lr=float(training.get("discriminator_lr", training["lr"])),
-        betas=tuple(training.get("discriminator_betas", [0.0, 0.99])),
-        weight_decay=float(training.get("discriminator_weight_decay", 0.0)),
-    ) if discriminator_parameters else None
-
+    g_optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(training["lr"]),
+        betas=tuple(training.get("betas", [0.9, 0.95])),
+        weight_decay=float(training.get("weight_decay", 0.0)),
+    )
+    d_optimizer = (
+        torch.optim.AdamW(
+            discriminator.parameters(),
+            lr=float(training.get("discriminator_lr", training["lr"])),
+            betas=tuple(training.get("discriminator_betas", [0.0, 0.99])),
+            weight_decay=float(training.get("discriminator_weight_decay", 0.0)),
+        )
+        if discriminator else None
+    )
     dtype = training.get("dtype", "bf16")
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == "fp16")
-    loss_config = config["loss"]
-    laplacian = LaplacianPyramidLoss(int(loss_config.get("laplacian_levels", 4))).to(device)
-    perceptual_enabled = float(loss_config.get("perceptual", 0.0)) != 0
-    identity_enabled = (
-        float(loss_config.get("identity", 0.0)) != 0
-        or float(loss_config.get("cross_identity", 0.0)) != 0
-    )
-    mouth_enabled = (
-        float(loss_config.get("mouth_landmark_velocity", 0.0)) != 0
-        or float(loss_config.get("mouth_openness_velocity", 0.0)) != 0
-    )
     perceptual = LocalVGGPerceptualLoss(
-        loss_config.get("vgg_weights_path") if perceptual_enabled else None
-    ).to(device)
-    identity = TorchScriptIdentityLoss(
-        loss_config.get("identity_model_path") if identity_enabled else None
-    ).to(device)
-    mouth_velocity = FrozenFANMouthVelocityLoss(
-        loss_config.get("fan_weights_path") if mouth_enabled else None,
-        package_path=loss_config.get("face_alignment_path"),
-        temperature=float(loss_config.get("fan_softargmax_temperature", 20.0)),
-        confidence_threshold=float(loss_config.get("fan_confidence_threshold", 0.20)),
-        smooth_l1_beta=float(loss_config.get("mouth_velocity_beta", 0.01)),
-        use_checkpoint=bool(loss_config.get("fan_gradient_checkpoint", True)),
-        input_grad_max_norm=float(loss_config.get("fan_input_grad_max_norm", 0.02)),
+        loss_config.get("vgg_weights_path")
+        if float(loss_config.get("perceptual", 0.0)) != 0 else None
     ).to(device)
 
     if world_size > 1:
-        model = DDP(
-            model,
-            device_ids=[local_rank] if device.type == "cuda" else None,
-            broadcast_buffers=False,
-            find_unused_parameters=bool(training.get("find_unused_parameters", True)),
-        )
-        if image_discriminator is not None:
-            image_discriminator = DDP(
-                image_discriminator, device_ids=[local_rank] if device.type == "cuda" else None
-            )
-        if video_discriminator is not None:
-            video_discriminator = DDP(
-                video_discriminator, device_ids=[local_rank] if device.type == "cuda" else None
-            )
+        model = DDP(model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=False)
+        if discriminator:
+            discriminator = DDP(discriminator, device_ids=[local_rank])
 
-    step, start_epoch = 0, 0
+    step, epoch = 0, 0
     resume = args.resume or config.get("resume")
     if resume == "latest":
         resume = latest_checkpoint(output_dir)
     if resume:
-        step, start_epoch = load_checkpoint(
-            resume, model, image_discriminator, video_discriminator,
-            generator_optimizer, discriminator_optimizer, scaler,
+        step, epoch = load_checkpoint(
+            resume, model, discriminator, g_optimizer, d_optimizer, scaler
         )
-        # A 512 fine-tune deliberately uses a new LR even though optimizer moments
-        # are restored from the 256 run.
-        base_lr = float(training["lr"])
-        for group in generator_optimizer.param_groups:
-            multiplier = float(training.get("motion_lr_multiplier", 1.0)) if group.get("name") == "motion" else 1.0
-            group["initial_lr"] = base_lr * multiplier
-            group["lr"] = group["initial_lr"]
-        if discriminator_optimizer is not None:
-            for group in discriminator_optimizer.param_groups:
-                group["lr"] = float(training.get("discriminator_lr", base_lr))
         LOG.info("resumed %s at step %d", resume, step)
 
     writer = SummaryWriter(output_dir) if rank == 0 else None
     if rank == 0:
-        parameters = sum(parameter.numel() for parameter in raw_module(model).parameters())
-        LOG.info("device=%s world_size=%d train=%d val=%d parameters=%.2fM",
-                 device, world_size, len(train_dataset), len(val_dataset), parameters / 1e6)
-        if not perceptual.enabled:
-            LOG.warning("VGG weights are not configured; using Laplacian/gradient losses only")
-        if not identity.enabled and cross_enabled:
-            LOG.warning("identity_model_path is empty; cross-ID uses motion-cycle + color statistics only")
-        if bool(training.get("freeze_motion_encoder", False)):
-            LOG.info("motion encoder is explicitly frozen for this fine-tune")
-        if cross_enabled and world_size == 1 and int(config["data"]["batch_size"]) < 2:
-            LOG.warning("cross-ID is inactive with one GPU and batch_size=1; use batch_size>=2 or DDP")
+        parameters = sum(p.numel() for p in raw_module(model).parameters())
+        LOG.info(
+            "device=%s world_size=%d train=%d val=%d parameters=%.3fM",
+            device, world_size, len(train_set), len(val_set), parameters / 1e6,
+        )
 
-    accum_steps = int(training.get("accumulation_steps", 1))
-    max_steps = int(training["max_steps"])
-    normalizer_step = int(config["stages"].get("normalizer_freeze_step", -1))
-    normalizer_start = int(config["stages"].get("normalizer_start_step", -1))
-    causal_start = int(config["stages"].get("causal_start", -1))
-    cross_start = int(config["stages"].get("cross_identity_start", -1))
-    image_gan_start = int(config["stages"].get("image_gan_start", -1))
-    video_gan_start = int(config["stages"].get("video_gan_start", -1))
-    noise_start = int(config["stages"].get("noise_start", -1))
-    render_chunk = int(training.get("render_chunk", 4))
+    maximum = int(training["max_steps"])
+    accumulation = int(training.get("accumulation_steps", 1))
+    render_chunk = int(training.get("render_chunk", 1))
     log_interval = int(training.get("log_interval", 20))
-    eval_interval = int(training.get("eval_interval", 2000))
-    save_interval = int(training.get("save_interval", 2000))
     preview_interval = int(training.get("preview_interval", 500))
-    last_time = time.time()
-
+    eval_interval = int(training.get("eval_interval", 1000))
+    save_interval = int(training.get("save_interval", 5000))
+    last_log = time.time()
     model.train()
-    generator_optimizer.zero_grad(set_to_none=True)
-    if discriminator_optimizer is not None:
-        discriminator_optimizer.zero_grad(set_to_none=True)
+    g_optimizer.zero_grad(set_to_none=True)
+    if d_optimizer:
+        d_optimizer.zero_grad(set_to_none=True)
 
-    epoch = start_epoch
-    while step < max_steps:
-        if train_sampler is not None:
+    while step < maximum:
+        if train_sampler:
             train_sampler.set_epoch(epoch)
         for micro_index, batch in enumerate(train_loader):
-            if step >= max_steps:
+            if step >= maximum:
                 break
-            raw = raw_module(model)
-            if normalizer_step >= 0 and step >= normalizer_step and not bool(raw.normalizer.ready.item()):
-                raw.normalizer.finalize()
-                barrier()
-                if rank == 0:
-                    LOG.info("froze motion normalization at step %d: std=[%.4f, %.4f]",
-                             step, raw.normalizer.std.min().item(), raw.normalizer.std.max().item())
-
-            set_learning_rates(generator_optimizer, step, training, bool(raw.normalizer.ready.item()))
-            causal_strength = stage_strength(
-                step, causal_start, int(config["stages"].get("causal_ramp_steps", 10000))
-            )
-            cross_active = cross_start >= 0 and step >= cross_start
-            image_gan_active = image_gan_start >= 0 and step >= image_gan_start
-            video_gan_active = video_gan_start >= 0 and step >= video_gan_start
-            noise_active = noise_start >= 0 and step >= noise_start
-            noise_strength = stage_strength(
-                step, noise_start, int(config["stages"].get("noise_ramp_steps", 10000))
-            ) * float(config["stages"].get("max_noise_sigma", 0.10))
-
+            set_lr(g_optimizer, step, training)
+            gan_active = gan_start >= 0 and step >= gan_start
             reference = batch["reference"].to(device, non_blocking=True)
             target = batch["frames"].to(device, non_blocking=True)
-            cross_reference = None
-            if cross_active and reference.shape[0] > 1:
-                cross_reference = reference.roll(1, dims=0)
-            elif cross_active and world_size > 1:
-                gathered = [torch.empty_like(reference) for _ in range(world_size)]
-                dist.all_gather(gathered, reference.detach())
-                cross_reference = gathered[(rank + 1) % world_size]
+            accumulation_boundary = (micro_index + 1) % accumulation == 0
 
-            set_requires_grad(image_discriminator, False)
-            set_requires_grad(video_discriminator, False)
-            with autocast_context(device, dtype):
-                output = model(
-                    reference, target, cross_reference=cross_reference,
-                    causal_strength=causal_strength,
-                    noise_sigma=noise_strength if noise_active else 0.0,
-                    noise_mode=config["stages"].get("noise_mode", "mixed"),
-                    render_chunk=render_chunk,
-                )
-                losses = compute_generator_losses(
-                    output, target, reference, config["loss"], laplacian,
-                    perceptual, identity, mouth_velocity,
-                    image_discriminator, video_discriminator,
-                    image_gan_active, video_gan_active,
-                )
-                generator_loss = losses["total"] / accum_steps
-            scaler.scale(generator_loss).backward()
-
-            # Corpus stats use only the configured late-training window, so
-            # early encoder drift does not contaminate the exported scale. The
-            # exporter always uses video frame zero as its origin, so random
-            # out-of-clip references must not broaden the token normalizer.
-            if normalizer_start >= 0 and step >= normalizer_start:
-                first_reference = batch["reference_is_first"].to(
-                    device=device, dtype=torch.bool, non_blocking=True
-                )
-                if bool(first_reference.any()):
-                    raw.normalizer.update(
-                        output["motion_delta"].detach()[first_reference]
-                    )
-
-            discriminator_losses = {"total": target.new_zeros(())}
-            if discriminator_optimizer is not None and (image_gan_active or video_gan_active):
-                set_requires_grad(image_discriminator, image_gan_active)
-                set_requires_grad(video_discriminator, video_gan_active)
+            set_requires_grad(discriminator, False)
+            generator_sync = (
+                model.no_sync()
+                if isinstance(model, DDP) and not accumulation_boundary
+                else contextlib.nullcontext()
+            )
+            with generator_sync:
                 with autocast_context(device, dtype):
-                    discriminator_losses = compute_discriminator_losses(
-                        output, target, config["loss"], image_discriminator,
-                        video_discriminator, image_gan_active, video_gan_active,
+                    output = model(reference, target, render_chunk=render_chunk)
+                    losses = generator_losses(
+                        output, target, loss_config, perceptual, discriminator, gan_active
                     )
-                    discriminator_loss = discriminator_losses["total"] / accum_steps
-                scaler.scale(discriminator_loss).backward()
+                scaler.scale(losses["total"] / accumulation).backward()
 
-            accumulation_boundary = (micro_index + 1) % accum_steps == 0
+            d_loss = target.new_zeros(())
+            if gan_active:
+                set_requires_grad(discriminator, True)
+                discriminator_sync = (
+                    discriminator.no_sync()
+                    if isinstance(discriminator, DDP) and not accumulation_boundary
+                    else contextlib.nullcontext()
+                )
+                with discriminator_sync:
+                    with autocast_context(device, dtype):
+                        d_loss = discriminator_loss(
+                            output, target, loss_config, discriminator
+                        )
+                    scaler.scale(d_loss / accumulation).backward()
+
             if not accumulation_boundary:
                 continue
-
-            scaler.unscale_(generator_optimizer)
+            scaler.unscale_(g_optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), float(training.get("grad_clip", 1.0))
             )
-            scaler.step(generator_optimizer)
-            if discriminator_optimizer is not None and (image_gan_active or video_gan_active):
-                scaler.unscale_(discriminator_optimizer)
+            scaler.step(g_optimizer)
+            if gan_active:
+                scaler.unscale_(d_optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    discriminator_parameters, float(training.get("discriminator_grad_clip", 5.0))
+                    discriminator.parameters(),
+                    float(training.get("discriminator_grad_clip", 5.0)),
                 )
-                scaler.step(discriminator_optimizer)
+                scaler.step(d_optimizer)
             scaler.update()
-            generator_optimizer.zero_grad(set_to_none=True)
-            if discriminator_optimizer is not None:
-                discriminator_optimizer.zero_grad(set_to_none=True)
+            g_optimizer.zero_grad(set_to_none=True)
+            if d_optimizer:
+                d_optimizer.zero_grad(set_to_none=True)
             step += 1
 
-            reduced_scalars = None
             if step % log_interval == 0:
-                scalar_tensors = dict(losses)
-                scalar_tensors.update({
-                    f"d_{name}": value for name, value in discriminator_losses.items()
-                })
                 with torch.no_grad():
-                    logged_motion = output["motion_delta"].detach().flatten(0, 1).float()
-                    motion_mean = logged_motion.mean(dim=0)
-                    motion_std = logged_motion.std(dim=0, unbiased=False)
-                    active_threshold = 0.25 * float(
-                        loss_config.get("motion_target_std", 0.20)
-                    )
-                    scalar_tensors.update({
-                        "motion_delta_mean_rms": motion_mean.square().mean().sqrt(),
-                        "motion_delta_std_mean": motion_std.mean(),
-                        "motion_delta_std_min": motion_std.min(),
-                        "motion_delta_std_max": motion_std.max(),
-                        "motion_active_fraction": (motion_std > active_threshold).float().mean(),
-                        "flow_abs_mean": output["flow"].detach().float().abs().mean(),
-                        "flow_abs_max": output["flow"].detach().float().abs().max(),
-                        "mask_mean": output["mask"].detach().float().mean(),
-                        "reference_first_fraction": batch["reference_is_first"].to(
-                            device=device, dtype=torch.float32, non_blocking=True
-                        ).mean(),
+                    alpha = output["target_motion"].detach().flatten(0, 1).float()
+                    alpha_std = alpha.std(dim=0, unbiased=False)
+                    scalars = reduce_scalars({
+                        **losses,
+                        "image_discriminator": d_loss,
+                        "alpha_std_mean": alpha_std.mean(),
+                        "alpha_std_min": alpha_std.min(),
+                        "alpha_std_max": alpha_std.max(),
+                        "alpha_active_fraction": (alpha_std > 0.01).float().mean(),
                     })
-                reduced_scalars = distributed_mean_scalars(scalar_tensors)
-
-            if rank == 0 and reduced_scalars is not None:
-                elapsed = max(time.time() - last_time, 1e-6)
-                last_time = time.time()
-                scalars = reduced_scalars
-                # Only expose objectives and diagnostics that this run actually
-                # uses.  Older configs intentionally return zero placeholders
-                # for disabled branches, but logging all of them makes the
-                # TensorBoard dashboard look active when no computation occurs.
-                mouth_enabled = (
-                    float(loss_config.get("mouth_landmark_velocity", 0.0)) != 0
-                    or float(loss_config.get("mouth_openness_velocity", 0.0)) != 0
-                )
-                always_logged = {
-                    "total", "reconstruction", "motion_delta_mean_rms",
-                    "motion_delta_std_mean", "motion_delta_std_min",
-                    "motion_delta_std_max", "motion_active_fraction",
-                    "flow_abs_mean", "flow_abs_max", "mask_mean",
-                    "reference_first_fraction",
-                }
-                mouth_diagnostics = {
-                    "mouth_landmark_confidence", "mouth_landmark_valid",
-                    "mouth_input_grad_norm", "mouth_input_grad_clipped",
-                }
-
-                def should_log_scalar(name: str) -> bool:
-                    if name in always_logged:
-                        return True
-                    if name in mouth_diagnostics:
-                        return mouth_enabled
-                    if name == "d_total":
-                        return image_gan_start >= 0 or video_gan_start >= 0
-                    if name == "d_image_discriminator":
-                        return image_gan_start >= 0
-                    if name == "d_video_discriminator":
-                        return video_gan_start >= 0
-                    return float(loss_config.get(name, 0.0)) != 0
-
-                visible_scalars = {
-                    name: value for name, value in scalars.items()
-                    if should_log_scalar(name)
-                }
-                log_parts = [
-                    f"step={step}",
-                    f"loss={scalars['total']:.4f}",
-                    f"rec={scalars['reconstruction']:.4f}",
-                ]
-                for name, label in (
-                    ("perceptual", "perc"),
-                    ("flow_tv", "flow_tv"),
-                    ("covariance", "cov"),
-                    ("motion_moment", "moment"),
-                    ("motion_sparsity", "sparse"),
-                    ("image_adversarial", "g_adv"),
-                    ("feature_matching", "fm"),
-                    ("d_image_discriminator", "d_img"),
-                ):
-                    if name in visible_scalars:
-                        log_parts.append(f"{label}={visible_scalars[name]:.4f}")
-                log_parts.extend([
-                    f"dstd={scalars['motion_delta_std_mean']:.3f}",
-                    f"active={scalars['motion_active_fraction']:.2f}",
-                    f"flow_mag={scalars['flow_abs_mean']:.4f}",
-                    f"mask={scalars['mask_mean']:.3f}",
-                    f"grad={float(grad_norm):.3f}",
-                    f"lr={generator_optimizer.param_groups[0]['lr']:.2e}",
-                    f"mem={torch.cuda.max_memory_allocated(device) / (1024 ** 3) if device.type == 'cuda' else 0.0:.2f}GB",
-                    f"steps/s={log_interval / elapsed:.3f}",
-                ])
-                LOG.info(" ".join(log_parts))
-                for name, value in visible_scalars.items():
-                    writer.add_scalar(f"train/{name}", value, step)
-                if causal_start >= 0:
-                    writer.add_scalar("train/causal_strength", causal_strength, step)
-                if noise_start >= 0:
-                    writer.add_scalar("train/noise_sigma", noise_strength, step)
-                writer.add_scalar("train/grad_norm", float(grad_norm), step)
-                for group in generator_optimizer.param_groups:
-                    writer.add_scalar(f"lr/{group['name']}", group["lr"], step)
+                if rank == 0:
+                    elapsed = max(time.time() - last_log, 1e-6)
+                    last_log = time.time()
+                    parts = [
+                        f"step={step}",
+                        f"loss={scalars['total']:.4f}",
+                        f"rec={scalars['reconstruction']:.4f}",
+                        f"perc={scalars['perceptual']:.4f}",
+                    ]
+                    if gan_active:
+                        parts += [
+                            f"g_adv={scalars['image_adversarial']:.4f}",
+                            f"d_img={scalars['image_discriminator']:.4f}",
+                        ]
+                    parts += [
+                        f"astd={scalars['alpha_std_mean']:.3f}",
+                        f"active={scalars['alpha_active_fraction']:.2f}",
+                        f"grad={float(grad_norm):.3f}",
+                        f"lr={g_optimizer.param_groups[0]['lr']:.2e}",
+                        f"mem={torch.cuda.max_memory_allocated(device) / 1024 ** 3 if device.type == 'cuda' else 0.0:.2f}GB",
+                        f"steps/s={log_interval / elapsed:.3f}",
+                    ]
+                    LOG.info(" ".join(parts))
+                    for name, value in scalars.items():
+                        writer.add_scalar(f"train/{name}", value, step)
+                    writer.add_scalar("train/grad_norm", float(grad_norm), step)
+                    writer.add_scalar("lr/generator", g_optimizer.param_groups[0]["lr"], step)
 
             if rank == 0 and preview_interval > 0 and step % preview_interval == 0:
                 save_preview(
                     os.path.join(output_dir, f"preview_{step:09d}.jpg"),
                     reference.detach(), target.detach(), output["reconstruction"].detach(),
                 )
-
             if eval_interval > 0 and step % eval_interval == 0:
-                metrics = validate(model, val_loader, device, config, causal_strength)
+                metrics = validate(model, val_loader, device, config)
                 if rank == 0:
                     LOG.info("validation step=%d %s", step, json.dumps(metrics, sort_keys=True))
                     for name, value in metrics.items():
                         writer.add_scalar(f"validation/{name}", value, step)
                 barrier()
-
             if save_interval > 0 and step % save_interval == 0:
                 barrier()
                 if rank == 0:
                     save_checkpoint(
                         os.path.join(output_dir, f"step_{step:09d}.pt"),
-                        model, image_discriminator, video_discriminator,
-                        generator_optimizer, discriminator_optimizer, scaler,
-                        step, epoch, config,
+                        model, discriminator, g_optimizer, d_optimizer,
+                        scaler, step, epoch, config,
                     )
                 barrier()
         epoch += 1
@@ -976,11 +566,10 @@ def main() -> None:
     if rank == 0 and not args.skip_final_save:
         save_checkpoint(
             os.path.join(output_dir, f"step_{step:09d}.pt"),
-            model, image_discriminator, video_discriminator,
-            generator_optimizer, discriminator_optimizer, scaler,
-            step, epoch, config,
+            model, discriminator, g_optimizer, d_optimizer,
+            scaler, step, epoch, config,
         )
-    if rank == 0 and writer is not None:
+    if writer:
         writer.close()
     barrier()
     if dist.is_available() and dist.is_initialized():
