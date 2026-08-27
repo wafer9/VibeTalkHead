@@ -98,6 +98,7 @@ class JsonlVideoClipDataset(Dataset):
         clip_length: int = 16,
         image_size: int = 256,
         target_fps: float = 25.0,
+        sampling_mode: str = "clip",
         training: bool = True,
         first_frame_reference_prob: float = 0.5,
         photometric_strength: float = 0.12,
@@ -113,6 +114,13 @@ class JsonlVideoClipDataset(Dataset):
         self.clip_length = int(clip_length)
         self.image_size = int(image_size)
         self.target_fps = float(target_fps)
+        self.sampling_mode = str(sampling_mode)
+        if self.sampling_mode not in {"clip", "random_pair"}:
+            raise ValueError(
+                f"sampling_mode must be 'clip' or 'random_pair', got {self.sampling_mode!r}"
+            )
+        if self.sampling_mode == "random_pair" and self.clip_length != 1:
+            raise ValueError("random_pair sampling requires clip_length=1")
         self.training = bool(training)
         self.first_frame_reference_prob = float(first_frame_reference_prob)
         self.photometric_strength = float(photometric_strength)
@@ -128,6 +136,17 @@ class JsonlVideoClipDataset(Dataset):
         return _read_record(self.manifest, self.offsets, index % len(self.offsets))
 
     def _sample_indices(self, length: int, fps: float) -> tuple[np.ndarray, int]:
+        if self.sampling_mode == "random_pair":
+            if length < 2:
+                raise ValueError("video too short for a distinct source/target pair")
+            if self.training:
+                reference, target = random.sample(range(length), 2)
+            else:
+                reference, target = 0, length // 2
+                if target == reference:
+                    target = length - 1
+            return np.asarray([target], dtype=np.int64), reference
+
         stride = max(fps / self.target_fps, 1.0)
         span = int(round((self.clip_length - 1) * stride)) + 1
         if length < span:

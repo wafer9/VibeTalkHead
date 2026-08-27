@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -11,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
 from torch.utils.checkpoint import checkpoint
+
+from .liax.ops import ConvLayer, EqualLinear
 
 
 def charbonnier(prediction: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
@@ -47,24 +50,56 @@ class LaplacianPyramidLoss(nn.Module):
 
 
 class LocalVGGPerceptualLoss(nn.Module):
-    """Optional VGG loss that never downloads weights implicitly."""
+    """Frozen VGG feature loss with optional LIA-style image pyramids.
 
-    def __init__(self, weights_path: Optional[str] = None):
+    Weights are always loaded from a local file.  The LIA setting uses VGG19
+    features after relu1_1..relu5_1 and sums feature L1 over 256/128/64/32
+    inputs, matching the perceptual pyramid described in the paper.
+    """
+
+    def __init__(
+        self,
+        weights_path: Optional[str] = None,
+        model_name: str = "vgg16",
+        pyramid_sizes: Optional[Iterable[int]] = None,
+        feature_weights: Optional[Iterable[float]] = None,
+    ):
         super().__init__()
         self.enabled = bool(weights_path)
+        self.model_name = str(model_name).lower()
+        self.pyramid_sizes = tuple(int(size) for size in (pyramid_sizes or ()))
         if not self.enabled:
             self.blocks = nn.ModuleList()
             return
-        from torchvision.models import vgg16
-        model = vgg16(weights=None)
+        if not os.path.isfile(str(weights_path)):
+            raise FileNotFoundError(f"VGG weights not found: {weights_path}")
+        if self.model_name == "vgg19":
+            from torchvision.models import vgg19
+            model = vgg19(weights=None)
+            boundaries = (2, 7, 12, 21, 30)
+        elif self.model_name == "vgg16":
+            from torchvision.models import vgg16
+            model = vgg16(weights=None)
+            boundaries = (4, 9, 16, 23)
+        else:
+            raise ValueError(f"unsupported VGG model: {model_name}")
         payload = torch.load(weights_path, map_location="cpu", weights_only=True)
         if isinstance(payload, dict) and "state_dict" in payload:
             payload = payload["state_dict"]
         model.load_state_dict(payload)
         features = model.features
-        self.blocks = nn.ModuleList([
-            features[:4], features[4:9], features[9:16], features[16:23],
-        ])
+        starts = (0,) + boundaries[:-1]
+        self.blocks = nn.ModuleList(
+            features[start:stop] for start, stop in zip(starts, boundaries)
+        )
+        if feature_weights is None:
+            feature_weights = [1.0] * len(self.blocks)
+        self.feature_weights = tuple(float(weight) for weight in feature_weights)
+        if len(self.feature_weights) != len(self.blocks):
+            raise ValueError(
+                "feature_weights must have one value per VGG feature block: "
+                f"expected {len(self.blocks)}, got {len(self.feature_weights)}"
+            )
         for parameter in self.parameters():
             parameter.requires_grad = False
         self.eval()
@@ -75,20 +110,40 @@ class LocalVGGPerceptualLoss(nn.Module):
         super().train(False)
         return self
 
+    def _single_scale(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        prediction = (
+            prediction.clamp(-1, 1).add(1).mul(0.5) - self.mean.to(prediction)
+        ) / self.std.to(prediction)
+        target = (
+            target.clamp(-1, 1).add(1).mul(0.5) - self.mean.to(target)
+        ) / self.std.to(target)
+        total = prediction.new_zeros(())
+        x, y = prediction, target
+        for block, weight in zip(self.blocks, self.feature_weights):
+            x = block(x)
+            with torch.no_grad():
+                y = block(y)
+            total = total + weight * F.l1_loss(x, y)
+        return total
+
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return prediction.new_zeros(())
         prediction = prediction.flatten(0, 1) if prediction.ndim == 5 else prediction
         target = target.flatten(0, 1) if target.ndim == 5 else target
-        prediction = (prediction.add(1).mul(0.5) - self.mean.to(prediction)) / self.std.to(prediction)
-        target = (target.add(1).mul(0.5) - self.mean.to(target)) / self.std.to(target)
+        if not self.pyramid_sizes:
+            return self._single_scale(prediction, target)
         total = prediction.new_zeros(())
-        x, y = prediction, target
-        for block in self.blocks:
-            x = block(x)
-            with torch.no_grad():
-                y = block(y)
-            total = total + F.l1_loss(x, y)
+        for size in self.pyramid_sizes:
+            pred_scale = F.interpolate(
+                prediction, size=(size, size), mode="bilinear",
+                align_corners=False, antialias=True,
+            )
+            target_scale = F.interpolate(
+                target, size=(size, size), mode="bilinear",
+                align_corners=False, antialias=True,
+            )
+            total = total + self._single_scale(pred_scale, target_scale)
         return total
 
 
@@ -469,6 +524,69 @@ class MultiScaleImageDiscriminator(nn.Module):
         return outputs
 
 
+class LIAImageDiscriminator(nn.Module):
+    """Full-image StyleGAN discriminator used by the released LIA trainer."""
+
+    def __init__(self, image_size: int = 512, channel_multiplier: int = 1):
+        super().__init__()
+        image_size = int(image_size)
+        if image_size < 8 or image_size & (image_size - 1):
+            raise ValueError("image_size must be a power of two and at least 8")
+        channels = {
+            4: 512,
+            8: 512,
+            16: 512,
+            32: 512,
+            64: 256 * channel_multiplier,
+            128: 128 * channel_multiplier,
+            256: 64 * channel_multiplier,
+            512: 32 * channel_multiplier,
+            1024: 16 * channel_multiplier,
+        }
+        if image_size not in channels:
+            raise ValueError(f"unsupported discriminator image_size: {image_size}")
+        layers: List[nn.Module] = [ConvLayer(3, channels[image_size], 1)]
+        in_channel = channels[image_size]
+        for exponent in range(int(math.log2(image_size)), 2, -1):
+            out_channel = channels[2 ** (exponent - 1)]
+            layers.append(_LIAResidualDownBlock(in_channel, out_channel))
+            in_channel = out_channel
+        self.convs = nn.Sequential(*layers)
+        self.final_conv = ConvLayer(in_channel + 1, channels[4], 3)
+        self.final_linear = nn.Sequential(
+            EqualLinear(channels[4] * 4 * 4, channels[4], activation="fused_lrelu"),
+            EqualLinear(channels[4], 1),
+        )
+
+    def forward(self, image: torch.Tensor):
+        out = self.convs(image)
+        batch, channels, height, width = out.shape
+        group = min(batch, 4)
+        while batch % group != 0:
+            group -= 1
+        stddev = out.view(group, -1, 1, channels, height, width)
+        stddev = torch.sqrt(stddev.var(0, unbiased=False) + 1e-8)
+        stddev = stddev.mean((2, 3, 4), keepdim=True).squeeze(2)
+        stddev = stddev.repeat(group, 1, height, width)
+        out = torch.cat((out, stddev), dim=1)
+        out = self.final_conv(out).reshape(batch, -1)
+        return [self.final_linear(out)]
+
+
+class _LIAResidualDownBlock(nn.Module):
+    def __init__(self, in_channel: int, out_channel: int):
+        super().__init__()
+        self.conv1 = ConvLayer(in_channel, in_channel, 3)
+        self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
+        self.skip = ConvLayer(
+            in_channel, out_channel, 1, downsample=True,
+            activate=False, bias=False,
+        )
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        return (self.conv2(self.conv1(tensor)) + self.skip(tensor)) / math.sqrt(2)
+
+
 class VideoDiscriminator(nn.Module):
     def __init__(self, base_channels: int = 32, max_channels: int = 256):
         super().__init__()
@@ -509,6 +627,26 @@ def discriminator_hinge(real_logits: Iterable[torch.Tensor], fake_logits: Iterab
 def generator_hinge(fake_logits: Iterable[torch.Tensor]) -> torch.Tensor:
     logits = [value[0] if isinstance(value, tuple) else value for value in fake_logits]
     return -sum(value.mean() for value in logits) / max(len(logits), 1)
+
+
+def discriminator_logistic(
+    real_logits: Iterable[torch.Tensor], fake_logits: Iterable[torch.Tensor]
+) -> torch.Tensor:
+    """Non-saturating logistic discriminator objective used by StyleGAN/LIA."""
+    losses = []
+    for real, fake in zip(real_logits, fake_logits):
+        if isinstance(real, tuple):
+            real = real[0]
+        if isinstance(fake, tuple):
+            fake = fake[0]
+        losses.append(F.softplus(-real).mean() + F.softplus(fake).mean())
+    return sum(losses) / max(len(losses), 1)
+
+
+def generator_nonsaturating(fake_logits: Iterable[torch.Tensor]) -> torch.Tensor:
+    """Non-saturating logistic generator objective."""
+    logits = [value[0] if isinstance(value, tuple) else value for value in fake_logits]
+    return sum(F.softplus(-value).mean() for value in logits) / max(len(logits), 1)
 
 
 def feature_matching_loss(real_outputs, fake_outputs) -> torch.Tensor:

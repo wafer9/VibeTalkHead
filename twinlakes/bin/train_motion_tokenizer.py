@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -27,13 +28,17 @@ from torchvision.utils import make_grid, save_image
 
 from twinlakes.motion_tokenizer.data import JsonlVideoClipDataset, build_jsonl_index, seed_worker
 from twinlakes.motion_tokenizer.losses import (
+    LIAImageDiscriminator,
     LocalVGGPerceptualLoss,
     MultiScaleImageDiscriminator,
     discriminator_hinge,
+    discriminator_logistic,
     generator_hinge,
+    generator_nonsaturating,
     set_requires_grad,
 )
 from twinlakes.motion_tokenizer.model import MotionTokenizer
+from twinlakes.utils.train_utils import send_dingtalk
 
 LOG = logging.getLogger("liax_motion_tokenizer")
 
@@ -52,6 +57,7 @@ def parse_args():
     parser.add_argument("--accumulation_steps", type=int)
     parser.add_argument("--image_gan_start", type=int)
     parser.add_argument("--log_interval", type=int)
+    parser.add_argument("--dingtalk_interval", type=int)
     parser.add_argument("--skip_final_save", action="store_true")
     return parser.parse_args()
 
@@ -105,6 +111,11 @@ def autocast_context(device, dtype):
 
 
 def set_lr(optimizer, step, training):
+    if str(training.get("lr_schedule", "cosine")) == "constant":
+        lr = float(training["lr"])
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        return
     warmup = int(training.get("warmup_steps", 0))
     maximum = int(training["max_steps"])
     if step < warmup:
@@ -116,6 +127,29 @@ def set_lr(optimizer, step, training):
     lr = float(training["lr"]) * (minimum + (1 - minimum) * scale)
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+def build_optimizer(parameters, training, *, discriminator=False):
+    prefix = "discriminator_" if discriminator else ""
+    name = str(training.get(prefix + "optimizer", training.get("optimizer", "adamw"))).lower()
+    lr = float(training.get(prefix + "lr", training["lr"]))
+    betas = tuple(training.get(prefix + "betas", training.get("betas", [0.9, 0.95])))
+    weight_decay = float(training.get(prefix + "weight_decay", 0.0))
+    if name == "adam":
+        return torch.optim.Adam(parameters, lr=lr, betas=betas, weight_decay=weight_decay)
+    if name == "adamw":
+        return torch.optim.AdamW(parameters, lr=lr, betas=betas, weight_decay=weight_decay)
+    raise ValueError(f"unsupported optimizer: {name}")
+
+
+def build_discriminator(config):
+    options = dict(config)
+    kind = str(options.pop("type", "multiscale_patch"))
+    if kind == "lia_stylegan":
+        return LIAImageDiscriminator(**options)
+    if kind == "multiscale_patch":
+        return MultiScaleImageDiscriminator(**options)
+    raise ValueError(f"unsupported image discriminator type: {kind}")
 
 
 def select_pairs(prediction, target, maximum):
@@ -143,9 +177,14 @@ def generator_losses(output, target, config, perceptual, discriminator, gan_acti
         losses["perceptual"] = perceptual(fake, real)
     if gan_active:
         fake, _ = select_pairs(prediction, target, int(config.get("max_gan_frames", 8)))
-        losses["image_adversarial"] = generator_hinge(discriminator(fake))
+        fake_logits = discriminator(fake)
+        if str(config.get("gan_type", "hinge")) == "nonsaturating":
+            losses["image_adversarial"] = generator_nonsaturating(fake_logits)
+        else:
+            losses["image_adversarial"] = generator_hinge(fake_logits)
     losses["total"] = sum(
-        float(config.get(name, 0.0)) * value for name, value in losses.items()
+        float(config.get(name, 0.0)) * losses[name]
+        for name in ("reconstruction", "perceptual", "image_adversarial")
     )
     return losses
 
@@ -156,7 +195,10 @@ def discriminator_loss(output, target, config, discriminator):
         target,
         int(config.get("max_gan_frames", 8)),
     )
-    return discriminator_hinge(discriminator(real), discriminator(fake))
+    real_logits, fake_logits = discriminator(real), discriminator(fake)
+    if str(config.get("gan_type", "hinge")) == "nonsaturating":
+        return discriminator_logistic(real_logits, fake_logits)
+    return discriminator_hinge(real_logits, fake_logits)
 
 
 def temporal_errors(prediction, target):
@@ -221,6 +263,14 @@ def reduce_scalars(values):
     return {name: float(value.item()) for name, value in zip(names, packed)}
 
 
+def send_dingtalk_safely(mode, epoch, step, loss, lr, loss_dict):
+    """Keep a transient DingTalk failure from interrupting distributed training."""
+    try:
+        send_dingtalk(mode, epoch, step, loss, lr, loss_dict)
+    except Exception:
+        LOG.exception("DingTalk loss notification failed at step %d", step)
+
+
 def latest_checkpoint(output_dir):
     found = []
     for path in Path(output_dir).glob("step_*.pt"):
@@ -278,6 +328,7 @@ def build_loaders(config, rank, world_size, generator):
         clip_length=int(data["clip_length"]),
         image_size=int(data["image_size"]),
         target_fps=float(data.get("target_fps", 25)),
+        sampling_mode=str(data.get("sampling_mode", "clip")),
         max_retries=int(data.get("max_retries", 12)),
     )
     train_set = JsonlVideoClipDataset(
@@ -344,6 +395,7 @@ def main():
         ("accumulation_steps", "training", "accumulation_steps"),
         ("image_gan_start", "stages", "image_gan_start"),
         ("log_interval", "training", "log_interval"),
+        ("dingtalk_interval", "training", "dingtalk_interval"),
         ("max_steps", "training", "max_steps"),
     ):
         value = getattr(args, argument)
@@ -377,29 +429,24 @@ def main():
     training, loss_config = config["training"], config["loss"]
     gan_start = int(config["stages"].get("image_gan_start", -1))
     discriminator = (
-        MultiScaleImageDiscriminator(**config["image_discriminator"]).to(device)
+        build_discriminator(config["image_discriminator"]).to(device)
         if gan_start >= 0 else None
     )
-    g_optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(training["lr"]),
-        betas=tuple(training.get("betas", [0.9, 0.95])),
-        weight_decay=float(training.get("weight_decay", 0.0)),
-    )
+    g_optimizer = build_optimizer(model.parameters(), training)
     d_optimizer = (
-        torch.optim.AdamW(
-            discriminator.parameters(),
-            lr=float(training.get("discriminator_lr", training["lr"])),
-            betas=tuple(training.get("discriminator_betas", [0.0, 0.99])),
-            weight_decay=float(training.get("discriminator_weight_decay", 0.0)),
-        )
+        build_optimizer(discriminator.parameters(), training, discriminator=True)
         if discriminator else None
     )
     dtype = training.get("dtype", "bf16")
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and dtype == "fp16")
     perceptual = LocalVGGPerceptualLoss(
-        loss_config.get("vgg_weights_path")
-        if float(loss_config.get("perceptual", 0.0)) != 0 else None
+        weights_path=(
+            loss_config.get("vgg_weights_path")
+            if float(loss_config.get("perceptual", 0.0)) != 0 else None
+        ),
+        model_name=loss_config.get("vgg_model", "vgg16"),
+        pyramid_sizes=loss_config.get("perceptual_pyramid_sizes", []),
+        feature_weights=loss_config.get("vgg_feature_weights"),
     ).to(device)
 
     if world_size > 1:
@@ -429,10 +476,13 @@ def main():
     accumulation = int(training.get("accumulation_steps", 1))
     render_chunk = int(training.get("render_chunk", 1))
     log_interval = int(training.get("log_interval", 20))
+    dingtalk_interval = int(training.get("dingtalk_interval", log_interval * 10))
     preview_interval = int(training.get("preview_interval", 500))
     eval_interval = int(training.get("eval_interval", 1000))
     save_interval = int(training.get("save_interval", 5000))
     last_log = time.time()
+    dingtalk_thread = None
+    dingtalk_mode = os.path.basename(output_dir.rstrip(os.sep)) or "motion_tokenizer"
     model.train()
     g_optimizer.zero_grad(set_to_none=True)
     if d_optimizer:
@@ -482,16 +532,20 @@ def main():
             if not accumulation_boundary:
                 continue
             scaler.unscale_(g_optimizer)
+            grad_clip = float(training.get("grad_clip", 0.0))
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), float(training.get("grad_clip", 1.0))
+                model.parameters(), grad_clip if grad_clip > 0 else float("inf")
             )
             scaler.step(g_optimizer)
             if gan_active:
                 scaler.unscale_(d_optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    discriminator.parameters(),
-                    float(training.get("discriminator_grad_clip", 5.0)),
+                discriminator_grad_clip = float(
+                    training.get("discriminator_grad_clip", 0.0)
                 )
+                if discriminator_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        discriminator.parameters(), discriminator_grad_clip
+                    )
                 scaler.step(d_optimizer)
             scaler.update()
             g_optimizer.zero_grad(set_to_none=True)
@@ -501,15 +555,27 @@ def main():
 
             if step % log_interval == 0:
                 with torch.no_grad():
-                    alpha = output["target_motion"].detach().flatten(0, 1).float()
-                    alpha_std = alpha.std(dim=0, unbiased=False)
+                    motion_delta = output["motion_delta"].detach().flatten(0, 1).float()
+                    motion_delta_std = motion_delta.std(dim=0, unbiased=False)
+                    flow_stats = output["flow_stats"].detach().float()
+                    reference_video = reference[:, None].expand_as(target)
+                    target_motion_l1 = F.l1_loss(target, reference_video)
+                    predicted_motion_l1 = F.l1_loss(
+                        output["reconstruction"].detach(), reference_video
+                    )
+                    copy_advantage = target_motion_l1 - losses["reconstruction"].detach()
+                    flow_scalars = {
+                        "flow_offset_mean": flow_stats[:, 0].mean(),
+                        "flow_mask_mean": flow_stats[:, 1].mean(),
+                        "flow_oob_fraction": flow_stats[:, 2].mean(),
+                    }
                     scalars = reduce_scalars({
                         **losses,
                         "image_discriminator": d_loss,
-                        "alpha_std_mean": alpha_std.mean(),
-                        "alpha_std_min": alpha_std.min(),
-                        "alpha_std_max": alpha_std.max(),
-                        "alpha_active_fraction": (alpha_std > 0.01).float().mean(),
+                        "motion_delta_std_mean": motion_delta_std.mean(),
+                        "motion_response_ratio": predicted_motion_l1 / target_motion_l1.clamp_min(1e-6),
+                        "copy_advantage": copy_advantage,
+                        **flow_scalars,
                     })
                 if rank == 0:
                     elapsed = max(time.time() - last_log, 1e-6)
@@ -526,18 +592,65 @@ def main():
                             f"d_img={scalars['image_discriminator']:.4f}",
                         ]
                     parts += [
-                        f"astd={scalars['alpha_std_mean']:.3f}",
-                        f"active={scalars['alpha_active_fraction']:.2f}",
+                        f"dstd={scalars['motion_delta_std_mean']:.3f}",
+                        f"mresp={scalars['motion_response_ratio']:.2f}",
+                        f"copyadv={scalars['copy_advantage']:.3f}",
+                        f"flow={scalars['flow_offset_mean']:.3f}",
+                        f"mask={scalars['flow_mask_mean']:.3f}",
+                        f"oob={scalars['flow_oob_fraction']:.3f}",
                         f"grad={float(grad_norm):.3f}",
                         f"lr={g_optimizer.param_groups[0]['lr']:.2e}",
                         f"mem={torch.cuda.max_memory_allocated(device) / 1024 ** 3 if device.type == 'cuda' else 0.0:.2f}GB",
                         f"steps/s={log_interval / elapsed:.3f}",
                     ]
                     LOG.info(" ".join(parts))
-                    for name, value in scalars.items():
-                        writer.add_scalar(f"train/{name}", value, step)
-                    writer.add_scalar("train/grad_norm", float(grad_norm), step)
-                    writer.add_scalar("lr/generator", g_optimizer.param_groups[0]["lr"], step)
+                    tensorboard_scalars = {
+                        "loss/total": scalars["total"],
+                        "loss/reconstruction": scalars["reconstruction"],
+                        "loss/perceptual": scalars["perceptual"],
+                        "loss/g_adversarial": scalars["image_adversarial"],
+                        "loss/d_image": scalars["image_discriminator"],
+                        "motion/delta_std": scalars["motion_delta_std_mean"],
+                        "diagnostic/motion_response": scalars["motion_response_ratio"],
+                        "diagnostic/copy_advantage": scalars["copy_advantage"],
+                        "flow/offset": scalars["flow_offset_mean"],
+                        "flow/mask": scalars["flow_mask_mean"],
+                        "flow/oob": scalars["flow_oob_fraction"],
+                        "optim/grad_norm": float(grad_norm),
+                        "optim/lr_generator": g_optimizer.param_groups[0]["lr"],
+                    }
+                    for name, value in tensorboard_scalars.items():
+                        writer.add_scalar(name, value, step)
+                    if dingtalk_interval > 0 and step % dingtalk_interval == 0:
+                        if dingtalk_thread is None or not dingtalk_thread.is_alive():
+                            dingtalk_losses = {
+                                "rec": scalars["reconstruction"],
+                                "perc": scalars["perceptual"],
+                            }
+                            if gan_active:
+                                dingtalk_losses.update({
+                                    "g_adv": scalars["image_adversarial"],
+                                    "d_img": scalars["image_discriminator"],
+                                })
+                            dingtalk_thread = threading.Thread(
+                                target=send_dingtalk_safely,
+                                args=(
+                                    dingtalk_mode,
+                                    epoch,
+                                    step,
+                                    scalars["total"],
+                                    f"{g_optimizer.param_groups[0]['lr']:.2e}",
+                                    dingtalk_losses,
+                                ),
+                                name="dingtalk-loss",
+                                daemon=True,
+                            )
+                            dingtalk_thread.start()
+                        else:
+                            LOG.warning(
+                                "skip DingTalk notification at step %d: previous send is still running",
+                                step,
+                            )
 
             if rank == 0 and preview_interval > 0 and step % preview_interval == 0:
                 save_preview(

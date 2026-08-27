@@ -391,8 +391,19 @@ class ToRGB(nn.Module):
 		return out
 
 class ToFlow(nn.Module):
-	def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=[1, 3, 3, 1]):
+	def __init__(
+		self,
+		in_channel,
+		style_dim,
+		upsample=True,
+		blur_kernel=[1, 3, 3, 1],
+		identity_init=False,
+		init_scale=1.0,
+	):
 		super().__init__()
+		init_scale = float(init_scale)
+		if init_scale < 0:
+			raise ValueError(f"ToFlow init_scale must be non-negative, got {init_scale}")
 		
 		self.upsample = upsample
 		if upsample:
@@ -400,6 +411,16 @@ class ToFlow(nn.Module):
 
 		self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
 		self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
+		# A fully random ToFlow produces saturated offsets after the seven
+		# coarse-to-fine skip additions, while an all-zero head initially cuts
+		# the gradient from flow/mask back to motion conditioning.  Preserve the
+		# random directions but make their initial magnitude small.  The legacy
+		# identity flag remains equivalent to scale=0 for old checkpoints/configs.
+		self.init_scale = 0.0 if identity_init else init_scale
+		with torch.no_grad():
+			self.conv.weight.mul_(self.init_scale)
+			self.bias.zero_()
+		self.last_stats = None
 
 	def forward(self, h, style, feat, skip=None):
 
@@ -419,8 +440,18 @@ class ToFlow(nn.Module):
 		sampler = torch.tanh(out[:, 0:2, :, :])
 		mask = torch.sigmoid(out[:, 2:3, :, :])
 		flow = sampler.permute(0, 2, 3, 1) + xs	
+
+		# Detached diagnostics for training logs.  Keeping only three scalar
+		# tensors avoids retaining the decoder graph or feature maps.
+		detached_flow = flow.detach()
+		self.last_stats = torch.stack([
+			sampler.detach().abs().mean(),
+			mask.detach().mean(),
+			(detached_flow.abs() > 1).any(dim=-1).float().mean(),
+		])
 		
-		feat_warp = F.grid_sample(feat, flow, align_corners=True) * mask
+		# Match the released LIA/LIA-X implementation and its pretrained model.
+		feat_warp = F.grid_sample(feat, flow, align_corners=False) * mask
 		h = feat_warp + (1 - mask) * h
 
 		#return h, out
@@ -449,9 +480,6 @@ class Direction(nn.Module):
 
 
 			
-
-
-
 
 
 

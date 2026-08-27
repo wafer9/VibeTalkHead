@@ -1,0 +1,83 @@
+# LIA-X-compatible 512x512 reconstruction model with half-depth decoder.
+seed: 2026
+output_dir: exp/motion_tokenizer_liax_smallflow_delta
+resume: null
+
+data:
+  train_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/train.json
+  val_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/dev.json
+  video_root: /nfs-speech-cfs/wangzhou/s2s/vibehead/data/talker/shards
+  target_fps: 25
+  image_size: 512
+  clip_length: 4
+  batch_size: 2
+  val_batch_size: 1
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  max_retries: 12
+  max_train_samples: 0
+  max_val_samples: 0
+  first_frame_reference_prob: 0.5
+  photometric_strength: 0.08
+  horizontal_flip_prob: 0.5
+
+model:
+  style_dim: 512
+  motion_dim: 64
+  scale: 1
+  decoder_blocks_per_stage: 2
+  # Shared source-feature/decoder channels at 8..512 resolution.
+  # channels: [512, 512, 256, 256, 128, 64, 32]
+  flow_identity_init: false
+  # Keep ToFlow motion gradients alive without saturating the 7-level
+  # coarse-to-fine residual-flow pyramid.
+  flow_init_scale: 0.01
+
+training:
+  # 2 clips/GPU x 16 GPUs x 2 accumulation = 64 clips/update.
+  max_steps: 50000
+  warmup_steps: 200
+  min_lr_ratio: 0.10
+  # Original LIA uses 2e-3 at total batch 32. Start this deeper LIA-X
+  # renderer at 1e-3; increase only after gradients/GAN balance are verified.
+  lr: 0.001
+  discriminator_lr: 0.001
+  betas: [0.9, 0.999]
+  discriminator_betas: [0.9, 0.999]
+  weight_decay: 0.0
+  discriminator_weight_decay: 0.0
+  accumulation_steps: 2
+  grad_clip: 1.0
+  discriminator_grad_clip: 5.0
+  dtype: bf16
+  render_chunk: 2
+  log_interval: 20
+  # Rank 0 sends total/rec/perc/GAN losses every 200 optimizer steps.
+  # Set to 0 to disable DingTalk notifications.
+  dingtalk_interval: 200
+  preview_interval: 500
+  eval_interval: 1000
+  validation_batches: 8
+  save_interval: 5000
+
+stages:
+  image_gan_start: 1000
+
+loss:
+  reconstruction: 1.0
+  # L_G = L1 + multi-scale VGG19 + non-saturating GAN.
+  perceptual: 1.0
+  image_adversarial: 1.0
+  max_perceptual_frames: 2
+  max_gan_frames: 2
+  vgg_model: vgg19
+  perceptual_pyramid_sizes: [256, 128, 64, 32]
+  vgg_weights_path: checkpoints/motion_tokenizer/vgg19-dcbb9e9d.pth
+  gan_type: nonsaturating
+
+image_discriminator:
+  scales: 3
+  base_channels: 64
+  max_channels: 512
+  num_layers: 5

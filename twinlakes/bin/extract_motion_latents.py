@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Extract the absolute alpha coefficients learned by official LIA-X."""
+"""Extract first-frame-relative motion deltas learned by the LIA-X tokenizer."""
 
 from __future__ import annotations
 
@@ -108,6 +108,7 @@ def main():
                         model, video_path, args.target_fps, args.batch_frames,
                         image_size, device,
                     )
+                    motion = motion - motion[:1]
                     os.makedirs(output_dir, exist_ok=True)
                     temporary = output_path + f".tmp.{os.getpid()}"
                     torch.save({
@@ -115,7 +116,7 @@ def main():
                         "fps": args.target_fps,
                         "motion_dim": model.motion_dim,
                         "normalized": False,
-                        "representation": "liax_absolute_alpha",
+                        "representation": "liax_first_frame_relative_delta",
                         "source_checkpoint": os.path.abspath(args.checkpoint),
                     }, temporary)
                     os.replace(temporary, output_path)

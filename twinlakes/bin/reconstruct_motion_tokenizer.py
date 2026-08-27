@@ -43,6 +43,16 @@ def parse_args():
         "--audio_root", default=None,
         help="base directory for relative wav_path/audio entries (defaults to manifest directory)",
     )
+    parser.add_argument(
+        "--video_codec", choices=("mp4v", "h264"), default="mp4v",
+        help="final MP4 codec; h264 streams raw RGB frames directly to ffmpeg/libx264",
+    )
+    parser.add_argument("--h264_crf", type=int, default=18)
+    parser.add_argument("--h264_preset", default="medium")
+    parser.add_argument(
+        "--ffmpeg_bin", default="ffmpeg",
+        help="ffmpeg executable; it must provide libx264 for --video_codec h264",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -71,6 +81,8 @@ def decode_frames(reader, indices, resolution: int):
 def reconstruct_to_file(model, video_path: str, output_path: str, args, device):
     reader, indices = video_reader_and_indices(video_path, args.fps)
     reference = decode_frames(reader, indices[:1], args.resolution).to(device)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        reference_motion = model.encode_motion(reference).float().cpu()
     motion_parts = []
     for start in range(0, len(indices), args.encode_batch):
         chunk = decode_frames(
@@ -80,27 +92,53 @@ def reconstruct_to_file(model, video_path: str, output_path: str, args, device):
             motion = model.encode_motion(chunk)
         motion_parts.append(motion.float().cpu())
     absolute_motion = torch.cat(motion_parts, dim=0)
+    motion_delta = absolute_motion - reference_motion
 
-    writer = cv2.VideoWriter(
-        output_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
-        (args.resolution, args.resolution),
-    )
-    if not writer.isOpened():
-        raise RuntimeError(f"cannot create {output_path}")
+    writer = None
+    encoder = None
+    if args.video_codec == "h264":
+        encoder = subprocess.Popen([
+            args.ffmpeg_bin, "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s:v", f"{args.resolution}x{args.resolution}",
+            "-r", str(args.fps), "-i", "pipe:0", "-an",
+            "-c:v", "libx264", "-preset", args.h264_preset,
+            "-crf", str(args.h264_crf), "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", output_path,
+        ], stdin=subprocess.PIPE)
+    else:
+        writer = cv2.VideoWriter(
+            output_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps,
+            (args.resolution, args.resolution),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"cannot create {output_path}")
     try:
-        for start in range(0, absolute_motion.shape[0], args.render_chunk):
-            stop = min(absolute_motion.shape[0], start + args.render_chunk)
-            alpha = absolute_motion[start:stop].to(device).unsqueeze(0)
+        for start in range(0, motion_delta.shape[0], args.render_chunk):
+            stop = min(motion_delta.shape[0], start + args.render_chunk)
+            delta = motion_delta[start:stop].to(device).unsqueeze(0)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 prediction = model.render_motion(
-                    reference, alpha, render_chunk=args.render_chunk
+                    reference, delta, render_chunk=args.render_chunk
                 )[0]
             rgb = prediction.float().cpu().add(1).mul(127.5).clamp(0, 255)
             rgb = rgb.byte().permute(0, 2, 3, 1).numpy()
             for frame in rgb:
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                if encoder is not None:
+                    encoder.stdin.write(frame.tobytes())
+                else:
+                    writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     finally:
-        writer.release()
+        if writer is not None:
+            writer.release()
+        if encoder is not None:
+            try:
+                encoder.stdin.close()
+            except BrokenPipeError:
+                pass
+            return_code = encoder.wait()
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, encoder.args)
 
 
 def resolve_audio_path(record, manifest: str, audio_root: str | None) -> str:
@@ -114,11 +152,15 @@ def resolve_audio_path(record, manifest: str, audio_root: str | None) -> str:
 
 
 def mux_audio(
-    video_path: str, source_video_path: str, audio_path: str, output_path: str
+    video_path: str,
+    source_video_path: str,
+    audio_path: str,
+    output_path: str,
+    ffmpeg_bin: str,
 ) -> None:
-    """Mux the exact GT audio track, falling back to the manifest waveform."""
+    """Mux the exact GT audio, falling back to the manifest waveform."""
     source_command = [
-        "ffmpeg", "-y", "-loglevel", "error",
+        ffmpeg_bin, "-y", "-loglevel", "error",
         "-i", video_path, "-i", source_video_path,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-c:a", "copy",
@@ -131,7 +173,7 @@ def mux_audio(
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(audio_path)
     subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error",
+        ffmpeg_bin, "-y", "-loglevel", "error",
         "-i", video_path, "-i", audio_path,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
@@ -141,6 +183,20 @@ def mux_audio(
 
 def main():
     args = parse_args()
+    if not 0 <= args.h264_crf <= 51:
+        raise ValueError(f"--h264_crf must be in [0, 51], got {args.h264_crf}")
+    if not os.path.isfile(args.ffmpeg_bin) and os.path.dirname(args.ffmpeg_bin):
+        raise FileNotFoundError(f"ffmpeg executable not found: {args.ffmpeg_bin}")
+    if args.video_codec == "h264":
+        encoder_list = subprocess.run(
+            [args.ffmpeg_bin, "-hide_banner", "-encoders"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        if "libx264" not in encoder_list:
+            raise RuntimeError(
+                f"{args.ffmpeg_bin} has no libx264 encoder; pass --ffmpeg_bin "
+                "/usr/bin/ffmpeg or another GPL-enabled ffmpeg build"
+            )
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -169,8 +225,13 @@ def main():
                 silent_path = os.path.join(args.output_dir, key + ".noaudio.mp4")
                 try:
                     reconstruct_to_file(model, video_path, silent_path, args, device)
-                    audio_path = resolve_audio_path(record, args.manifest, args.audio_root)
-                    mux_audio(silent_path, video_path, audio_path, output_path)
+                    audio_path = resolve_audio_path(
+                        record, args.manifest, args.audio_root
+                    )
+                    mux_audio(
+                        silent_path, video_path, audio_path, output_path,
+                        args.ffmpeg_bin,
+                    )
                 finally:
                     if os.path.isfile(silent_path):
                         os.remove(silent_path)
@@ -178,6 +239,8 @@ def main():
                 reconstruct_to_file(model, video_path, output_path, args, device)
             completed += 1
         except Exception as exc:
+            if os.path.isfile(output_path):
+                os.remove(output_path)
             print(f"failed {key}: {exc!r}", flush=True)
             failed += 1
     print(f"completed={completed} skipped={skipped} failed={failed} output={args.output_dir}")

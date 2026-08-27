@@ -708,7 +708,9 @@ relative motion residual”的混合表示，而不是把 delta 当作免除 cro
 - 使用官方 Encoder2R、R2T alpha、Direction 正交字典、七级 StyledConv/ToFlow/ToRGB decoder；
 - 官方结构固定输入输出为 512x512，不能在不删层的情况下改成 256；
 - generator 为 227.753M 参数，其中 encoder 28.973M、decoder 198.780M；
-- motion latent 是官方 64D absolute alpha，训练 renderer 时不做 delta、normalizer、KL 或 causal 处理；
+- motion encoder 内部仍输出官方 64D absolute alpha，但 renderer 实际接收
+  `delta_t = alpha_target_t - alpha_reference`；训练和推理统一使用 reference-relative delta，
+  不再把 absolute alpha 直接送入 decoder；
 - loss 只保留 L1 reconstruction、VGG perceptual 和 multi-scale image GAN；
 - trainer 已删除 cross-ID、cycle、noise、causal、mouth/landmark、velocity loss、flow/mask regularizer、
   video GAN、feature matching 和 normalizer stage；TensorBoard 也不再记录这些字段；
@@ -720,9 +722,8 @@ relative motion residual”的混合表示，而不是把 delta 当作免除 cro
 双卡 L1+VGG+GAN 前后向均已通过。5k step 启动 image GAN，训练到50k。
 
 注意：官方 Decoder 没有输出 mask/flow diagnostics，因此新日志中不再出现 mask；这不是隐藏问题，而是训练
-wrapper 不再侵入官方计算图。导出脚本当前保存官方 absolute alpha，标记为 `liax_absolute_alpha`。是否转换成
-first-frame-relative delta、如何归一化和 Gaussian-friendly 训练，等 clean reconstruction 收敛后再做独立
-ablation，不混入本轮 baseline。
+wrapper 不再侵入官方计算图。导出脚本保存 first-frame-relative delta，标记为
+`liax_first_frame_relative_delta`。normalizer、KL 和 Gaussian-friendly 约束仍留作后续独立 ablation。
 
 正式训练入口：
 

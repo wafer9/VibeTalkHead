@@ -1,0 +1,83 @@
+# Controlled LIA-X reconstruction baseline.
+# The renderer is trained with native absolute alpha while exported tokens are
+# reference-relative deltas for the downstream LLM/DiT.
+seed: 2026
+output_dir: exp/motion_tokenizer_liax_baseline_stable
+resume: null
+
+data:
+  train_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/train.json
+  val_manifest: /nfs-speech-cfs/wangzhou/s2s/vibehead_wan/data/talker_vivid/dev.json
+  video_root: /nfs-speech-cfs/wangzhou/s2s/vibehead/data/talker/shards
+  image_size: 512
+  clip_length: 1
+  sampling_mode: random_pair
+  batch_size: 4
+  val_batch_size: 2
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: true
+  max_retries: 12
+  max_train_samples: 0
+  max_val_samples: 0
+  photometric_strength: 0.0
+  horizontal_flip_prob: 0.0
+
+model:
+  style_dim: 512
+  # Match the released LIA-X checkpoint rather than enlarging an unverified code.
+  motion_dim: 40
+  scale: 1
+  decoder_blocks_per_stage: 4
+  flow_identity_init: false
+  # LIA's full random head immediately saturates the seven-level 512px flow
+  # pyramid. Preserve random directions while starting near identity.
+  flow_init_scale: 0.01
+
+training:
+  # 4 independent pairs/GPU x 16 GPUs = 64 pairs/update.
+  max_steps: 100000
+  optimizer: adam
+  warmup_steps: 500
+  min_lr_ratio: 0.10
+  lr: 0.0005
+  betas: [0.9, 0.99]
+  weight_decay: 0.0
+  discriminator_optimizer: adam
+  discriminator_lr: 0.0002
+  discriminator_betas: [0.0, 0.99]
+  discriminator_weight_decay: 0.0
+  lr_schedule: cosine
+  accumulation_steps: 1
+  grad_clip: 5.0
+  discriminator_grad_clip: 5.0
+  dtype: bf16
+  render_chunk: 1
+  log_interval: 20
+  dingtalk_interval: 200
+  preview_interval: 500
+  eval_interval: 1000
+  validation_batches: 8
+  save_interval: 1000
+
+stages:
+  # First establish target-conditioned reconstruction; GAN cannot teach which
+  # pose/expression belongs to the target and is enabled only after this path works.
+  image_gan_start: 5000
+
+loss:
+  reconstruction: 1.0
+  perceptual: 1.0
+  image_adversarial: 1.0
+  max_perceptual_frames: 0
+  max_gan_frames: 0
+  vgg_model: vgg19
+  perceptual_pyramid_sizes: [512, 256, 128, 64]
+  vgg_feature_weights: [10, 10, 10, 10, 10]
+  vgg_weights_path: checkpoints/motion_tokenizer/vgg19-dcbb9e9d.pth
+  gan_type: nonsaturating
+
+image_discriminator:
+  type: lia_stylegan
+  image_size: 512
+  channel_multiplier: 1

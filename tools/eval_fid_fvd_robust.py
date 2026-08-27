@@ -7,6 +7,7 @@ The upstream pytorch-fid implementation rejects sqrtm imaginary residue above
 possible. We use the same real-valued Frechet formula and discard only this
 small numerical imaginary component.
 """
+import os
 import sys
 
 import numpy as np
@@ -15,6 +16,11 @@ import numpy as np
 VIBEHEAD = "/nfs-speech-cfs/wangzhou/s2s/vibehead"
 sys.path.insert(0, VIBEHEAD)
 import eval_fid_fvd as evaluation  # noqa: E402
+
+# The upstream evaluator uses a fixed /dev/shm work directory. Allow concurrent
+# evaluations to isolate their extracted frames instead of overwriting each other.
+evaluation.WORK = os.environ.get("FIDFVD_WORK", evaluation.WORK)
+os.makedirs(evaluation.WORK, exist_ok=True)
 
 
 def stable_frechet_distance(feat1, feat2):

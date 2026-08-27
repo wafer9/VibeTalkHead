@@ -38,34 +38,49 @@ class ResBlock(nn.Module):
 
 
 class Encoder2R(nn.Module):
-	def __init__(self, latent_dim=512, scale=1):
+	def __init__(self, latent_dim=512, scale=1, feature_channels=None):
 		super(Encoder2R, self).__init__()
-		
-		channels = [64*scale, 128*scale, 256*scale, 512*scale]
+
+		if feature_channels is None:
+			# Encoder order is 512 -> 8; decoder/source-feature order is 8 -> 512.
+			feature_channels = [
+				512 * scale,
+				512 * scale,
+				512 * scale,
+				512 * scale,
+				256 * scale,
+				128 * scale,
+				64 * scale,
+			]
+		if len(feature_channels) != 7:
+			raise ValueError("feature_channels must contain 7 values for 8..512 resolution")
+		channels = [int(channel) for channel in reversed(feature_channels)]
+		if any(channel <= 0 or channel % 32 != 0 for channel in channels):
+			raise ValueError("feature_channels must be positive multiples of 32")
 
 		# version1
-		self.block1 = ConvLayer(3, channels[0], 1) # 256, 3 -> 64
+		self.block1 = ConvLayer(3, channels[0], 1) # 512
 		self.block2 = nn.Sequential(
 			ResBlock(channels[0], channels[1])
-		) # 64 -> 128
+		) # 256
 		self.block3 = nn.Sequential(
 			ResBlock(channels[1], channels[2])
-		) # 128 -> 256
+		) # 128
 		self.block4 = nn.Sequential(
 			ResBlock(channels[2], channels[3])
-		) # 256 -> 512
+		) # 64
 		self.block5 = nn.Sequential(
-			ResBlock(channels[3], channels[3])
-		) # 512 -> 512
+			ResBlock(channels[3], channels[4])
+		) # 32
 		self.block6 = nn.Sequential(
-			ResBlock(channels[3], channels[3])
-		) # 512 -> 512
+			ResBlock(channels[4], channels[5])
+		) # 16
 		self.block7 = nn.Sequential(
-			ResBlock(channels[3], channels[3])
-		) # 512 -> 512
+			ResBlock(channels[5], channels[6])
+		) # 8
 		
-		self.block_512 = ResBlock(channels[3], channels[3])
-		self.block8 = EqualConv2d(channels[3], latent_dim, 4, padding=0, bias=False)
+		self.block_512 = ResBlock(channels[6], channels[6])
+		self.block8 = EqualConv2d(channels[6], latent_dim, 4, padding=0, bias=False)
 
 	def forward(self, x):
 
@@ -92,11 +107,11 @@ class Encoder2R(nn.Module):
 
 
 class Encoder(nn.Module):
-	def __init__(self, dim=512, dim_motion=20, scale=1):
+	def __init__(self, dim=512, dim_motion=20, scale=1, feature_channels=None):
 		super(Encoder, self).__init__()
 
 		# 2R netmork
-		self.enc_2r = Encoder2R(dim, scale)
+		self.enc_2r = Encoder2R(dim, scale, feature_channels)
 
 		# R2T
 		self.enc_r2t = nn.Sequential(

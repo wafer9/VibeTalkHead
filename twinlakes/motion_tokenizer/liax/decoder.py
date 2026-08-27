@@ -60,10 +60,56 @@ class ResBlock(nn.Module):
 
 
 class Decoder(nn.Module):
-	def __init__(self, style_dim, motion_dim, scale=1):
+	def __init__(
+		self,
+		style_dim,
+		motion_dim,
+		scale=1,
+		blocks_per_stage=4,
+		stage_channels=None,
+		flow_identity_init=False,
+		flow_init_scale=1.0,
+	):
 		super().__init__()
-		
-		channels = [512*scale, 256 * scale, 128 * scale, 64 * scale]
+		if blocks_per_stage < 1:
+			raise ValueError("blocks_per_stage must be at least 1")
+		self.blocks_per_stage = int(blocks_per_stage)
+
+		if stage_channels is None:
+			stage_channels = [
+				512 * scale,
+				512 * scale,
+				512 * scale,
+				512 * scale,
+				256 * scale,
+				128 * scale,
+				64 * scale,
+			]
+		if len(stage_channels) != 7:
+			raise ValueError("stage_channels must contain 7 values for 8..512 resolution")
+		channels = [int(channel) for channel in stage_channels]
+		if any(channel <= 0 or channel % 32 != 0 for channel in channels):
+			raise ValueError("stage_channels must be positive multiples of 32")
+
+		def flow_blocks(channel):
+			return nn.ModuleList([
+				FlowResBlock(channel, channel, style_dim)
+				for _ in range(self.blocks_per_stage)
+			])
+
+		def rgb_blocks(channel):
+			return nn.ModuleList([
+				ResBlock(channel, channel)
+				for _ in range(self.blocks_per_stage)
+			])
+
+		def flow_head(channel):
+			return ToFlow(
+				channel,
+				style_dim,
+				identity_init=bool(flow_identity_init),
+				init_scale=float(flow_init_scale),
+			)
 
 		self.direction = Direction(style_dim, motion_dim)
 
@@ -74,128 +120,58 @@ class Decoder(nn.Module):
 		
 		# for 512
 		self.conv_512_1 = StyledConv(channels[0], channels[0], 3, style_dim, True)
-		self.conv_512_2 = nn.ModuleList([
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-		])
-		self.conv_512_2_rgb = nn.ModuleList([
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-		])
+		self.conv_512_2 = flow_blocks(channels[0])
+		self.conv_512_2_rgb = rgb_blocks(channels[0])
 		self.rgb_512 = ToRGB(channels[0])
-		self.flow_512 = ToFlow(channels[0], style_dim)	# 16	
+		self.flow_512 = flow_head(channels[0])	# 8
 
 		# block2, 8
-		self.conv2_1 = StyledConv(channels[0], channels[0], 3, style_dim, True)
-		self.conv2_2 = nn.ModuleList([
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-		])
-		self.conv2_2_up = ConvLayer(channels[0], channels[0], 3, upsample=True)
-		self.conv2_2_rgb = nn.ModuleList([
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-		])
-		self.rgb2 = ToRGB(channels[0])
-		self.flow2 = ToFlow(channels[0], style_dim)  # 16
+		self.conv2_1 = StyledConv(channels[0], channels[1], 3, style_dim, True)
+		self.conv2_2 = flow_blocks(channels[1])
+		self.conv2_2_up = ConvLayer(channels[0], channels[1], 3, upsample=True)
+		self.conv2_2_rgb = rgb_blocks(channels[1])
+		self.rgb2 = ToRGB(channels[1])
+		self.flow2 = flow_head(channels[1])  # 16
 
 		# block3, 16
-		self.conv3_1 = StyledConv(channels[0], channels[0], 3, style_dim, True)
-		self.conv3_2 = nn.ModuleList([
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-		])
-		self.conv3_2_up = ConvLayer(channels[0], channels[0], 3, upsample=True)
-		self.conv3_2_rgb = nn.ModuleList([
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-		])
-		self.rgb3 = ToRGB(channels[0])
-		self.flow3 = ToFlow(channels[0], style_dim)  # 32
+		self.conv3_1 = StyledConv(channels[1], channels[2], 3, style_dim, True)
+		self.conv3_2 = flow_blocks(channels[2])
+		self.conv3_2_up = ConvLayer(channels[1], channels[2], 3, upsample=True)
+		self.conv3_2_rgb = rgb_blocks(channels[2])
+		self.rgb3 = ToRGB(channels[2])
+		self.flow3 = flow_head(channels[2])  # 32
 
 		# block4, 32
-		self.conv4_1 = StyledConv(channels[0], channels[0], 3, style_dim, True)
-		self.conv4_2 = nn.ModuleList([
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-			FlowResBlock(channels[0], channels[0], style_dim),
-		])
-		self.conv4_2_up = ConvLayer(channels[0], channels[0], 3, upsample=True)
-		self.conv4_2_rgb = nn.ModuleList([
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-			ResBlock(channels[0], channels[0]),
-		]) 
-		self.rgb4 = ToRGB(channels[0])
-		self.flow4 = ToFlow(channels[0], style_dim)  # 64
+		self.conv4_1 = StyledConv(channels[2], channels[3], 3, style_dim, True)
+		self.conv4_2 = flow_blocks(channels[3])
+		self.conv4_2_up = ConvLayer(channels[2], channels[3], 3, upsample=True)
+		self.conv4_2_rgb = rgb_blocks(channels[3])
+		self.rgb4 = ToRGB(channels[3])
+		self.flow4 = flow_head(channels[3])  # 64
 
 		# block5, 64
-		self.conv5_1 = StyledConv(channels[0], channels[1], 3, style_dim, True)
-		self.conv5_2 = nn.ModuleList([
-			FlowResBlock(channels[1], channels[1], style_dim),
-			FlowResBlock(channels[1], channels[1], style_dim),
-			FlowResBlock(channels[1], channels[1], style_dim),
-			FlowResBlock(channels[1], channels[1], style_dim),
-		])
-		self.conv5_2_up = ConvLayer(channels[0], channels[1], 3, upsample=True)
-		self.conv5_2_rgb = nn.ModuleList([
-			ResBlock(channels[1], channels[1]),
-			ResBlock(channels[1], channels[1]),
-			ResBlock(channels[1], channels[1]),
-			ResBlock(channels[1], channels[1]),
-		])
-		self.rgb5 = ToRGB(channels[1])
-		self.flow5 = ToFlow(channels[1], style_dim)  # 128
+		self.conv5_1 = StyledConv(channels[3], channels[4], 3, style_dim, True)
+		self.conv5_2 = flow_blocks(channels[4])
+		self.conv5_2_up = ConvLayer(channels[3], channels[4], 3, upsample=True)
+		self.conv5_2_rgb = rgb_blocks(channels[4])
+		self.rgb5 = ToRGB(channels[4])
+		self.flow5 = flow_head(channels[4])  # 128
 
 		# block6, 128
-		self.conv6_1 = StyledConv(channels[1], channels[2], 3, style_dim, True)
-		self.conv6_2 = nn.ModuleList([
-			FlowResBlock(channels[2], channels[2], style_dim),
-			FlowResBlock(channels[2], channels[2], style_dim),
-			FlowResBlock(channels[2], channels[2], style_dim),
-			FlowResBlock(channels[2], channels[2], style_dim),
-		])
-		self.conv6_2_up = ConvLayer(channels[1], channels[2], 3, upsample=True)
-		self.conv6_2_rgb = nn.ModuleList([
-			ResBlock(channels[2], channels[2]),
-			ResBlock(channels[2], channels[2]),
-			ResBlock(channels[2], channels[2]),
-			ResBlock(channels[2], channels[2]),
-		])
-		self.rgb6 = ToRGB(channels[2])
-		self.flow6 = ToFlow(channels[2], style_dim)  # 128
+		self.conv6_1 = StyledConv(channels[4], channels[5], 3, style_dim, True)
+		self.conv6_2 = flow_blocks(channels[5])
+		self.conv6_2_up = ConvLayer(channels[4], channels[5], 3, upsample=True)
+		self.conv6_2_rgb = rgb_blocks(channels[5])
+		self.rgb6 = ToRGB(channels[5])
+		self.flow6 = flow_head(channels[5])  # 256
 
 		# block7, 256
-		self.conv7_1 = StyledConv(channels[2], channels[3], 3, style_dim, True)
-		self.conv7_2 = nn.ModuleList([
-			FlowResBlock(channels[3], channels[3], style_dim),
-			FlowResBlock(channels[3], channels[3], style_dim),
-			FlowResBlock(channels[3], channels[3], style_dim),
-			FlowResBlock(channels[3], channels[3], style_dim),
-		])
-		self.conv7_2_up = ConvLayer(channels[2], channels[3], 3, upsample=True)
-		self.conv7_2_rgb = nn.ModuleList([
-			ResBlock(channels[3], channels[3]),
-			ResBlock(channels[3], channels[3]),
-			ResBlock(channels[3], channels[3]),
-			ResBlock(channels[3], channels[3]),
-		])
-		self.rgb7 = ToRGB(channels[3])
-		self.flow7 = ToFlow(channels[3], style_dim)  # 128
+		self.conv7_1 = StyledConv(channels[5], channels[6], 3, style_dim, True)
+		self.conv7_2 = flow_blocks(channels[6])
+		self.conv7_2_up = ConvLayer(channels[5], channels[6], 3, upsample=True)
+		self.conv7_2_rgb = rgb_blocks(channels[6])
+		self.rgb7 = ToRGB(channels[6])
+		self.flow7 = flow_head(channels[6])  # 512
 
 	def navigation(self, z_s2r, alpha):
 
@@ -292,5 +268,17 @@ class Decoder(nn.Module):
 		for conv in self.conv7_2_rgb:
 			h_warp7 = conv(h_warp7)
 		out = self.rgb7(h_warp7, rgb6)
+		self.last_flow_stats = torch.stack([
+			module.last_stats
+			for module in (
+				self.flow_512,
+				self.flow2,
+				self.flow3,
+				self.flow4,
+				self.flow5,
+				self.flow6,
+				self.flow7,
+			)
+		])
 
 		return out

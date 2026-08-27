@@ -8,6 +8,7 @@ keeps the input basename so it can be evaluated directly by eval_fid_fvd.py.
 import argparse
 import json
 import os
+import subprocess
 import sys
 import zlib
 
@@ -34,12 +35,38 @@ def get_args():
     p.add_argument("--batch", type=int, default=8)
     p.add_argument("--device", default="cuda")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--mux_audio", action="store_true",
+                   help="mux the source clip audio (or manifest wav) into each output")
     p.add_argument("--noise_sigma", type=float, default=0.0,
                    help="Gaussian perturbation std in normalized motion space")
     p.add_argument("--seed", type=int, default=2026)
     p.add_argument("--motion_std", default=os.path.join(
         VIBEHEAD, "twinlakes/dataset/stats/motion_std.npy"))
     return p.parse_args()
+
+
+def mux_audio(silent_path, source_video, wav_path, output_path):
+    """Mux the exact source audio when present, falling back to manifest wav."""
+    source_command = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", silent_path, "-i", source_video,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "copy", "-shortest",
+        "-movflags", "+faststart", output_path,
+    ]
+    try:
+        subprocess.run(source_command, check=True)
+        return
+    except subprocess.CalledProcessError:
+        if not wav_path or not os.path.isfile(wav_path):
+            raise
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", silent_path, "-i", wav_path,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest",
+        "-movflags", "+faststart", output_path,
+    ], check=True)
 
 
 def detensorize(x):
@@ -110,7 +137,15 @@ def main():
             # different sigma values, independent of processing/resume order.
             sample_seed = (args.seed + zlib.crc32(key.encode("utf-8"))) & 0xFFFFFFFF
             rng = np.random.default_rng(sample_seed)
-            n = reconstruct(model, video_path, out_path, args, motion_std, rng)
+            silent_path = (os.path.join(args.result_dir, f"{key}.noaudio.mp4")
+                           if args.mux_audio else out_path)
+            n = reconstruct(model, video_path, silent_path, args, motion_std, rng)
+            if args.mux_audio:
+                try:
+                    mux_audio(silent_path, video_path, record.get("wav_path"), out_path)
+                finally:
+                    if os.path.isfile(silent_path):
+                        os.unlink(silent_path)
             completed += 1
             print(f"[done] {key}: {n} frames", flush=True)
         except Exception as exc:
